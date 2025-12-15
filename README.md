@@ -1,26 +1,95 @@
-# Hnswlib - fast approximate nearest neighbor search
-Header-only C++ HNSW implementation with python bindings, insertions and updates.
+# hnswlib-mmap
 
-**NEWS:**
+A fork of [hnswlib](https://github.com/nmslib/hnswlib) with memory-mapped storage and graph-only index support for large-scale vector search.
 
-**version 0.8.0** 
+This fork adds two features for working with indexes that exceed available RAM:
 
-* Multi-vector document search and epsilon search (for now, only in C++)
-* By default, there is no statistic aggregation, which speeds up the multi-threaded search (it does not seem like people are using it anyway: [Issue #495](https://github.com/nmslib/hnswlib/issues/495)). 
-* Various bugfixes and improvements
-* `get_items` now have `return_type` parameter, which can be either 'numpy' or 'list'
+1. **Mmap-backed storage**: Use memory-mapped files instead of malloc during index construction
+2. **Graph-only mode**: Store only the graph structure (~95% smaller), with vectors provided externally
 
-Full list of changes: https://github.com/nmslib/hnswlib/pull/523
+These features enable building and searching HNSW indexes with hundreds of millions of vectors on memory-constrained systems.
 
-**version 0.7.0** 
+---
 
-* Added support to filtering (#402, #430) by [@kishorenc](https://github.com/kishorenc)
-* Added python interface for filtering (though note its performance is limited by GIL) (#417) by [@gtsoukas](https://github.com/gtsoukas)
-* Added support for replacing the elements that were marked as delete with newly inserted elements (to control the size of the index, #418) by [@dyashuni](https://github.com/dyashuni)
-* Fixed data races/deadlocks in updates/insertion, added stress test for multithreaded operation (#418) by [@dyashuni](https://github.com/dyashuni)
-* Documentation, tests, exception handling, refactoring (#375, #379, #380, #395, #396, #401, #406, #404, #409, #410, #416, #415, #431, #432, #433) by [@jlmelville](https://github.com/jlmelville), [@dyashuni](https://github.com/dyashuni), [@kishorenc](https://github.com/kishorenc), [@korzhenevski](https://github.com/korzhenevski), [@yoshoku](https://github.com/yoshoku), [@jianshu93](https://github.com/jianshu93), [@PLNech](https://github.com/PLNech)
-* global linkages (#383) by [@MasterAler](https://github.com/MasterAler), USE_SSE usage in MSVC (#408) by [@alxvth](https://github.com/alxvth)
+*Based on hnswlib v0.8.0. See the [original repository](https://github.com/nmslib/hnswlib) for the full feature set and documentation.*
 
+---
+
+## Fork-specific features
+
+### Graph-only mode
+
+Standard hnswlib stores vectors alongside the graph structure. For large indexes, this dominates memory usage:
+
+| Mode | Storage per element (M=8, dim=384) | 314M vectors |
+|------|-----------------------------------|--------------|
+| Standard | ~1,612 bytes | ~509 GB |
+| Graph-only | ~76 bytes | ~24 GB |
+
+Graph-only mode stores only the HNSW graph. Vectors are provided via a pointer to an external array (e.g., a memory-mapped numpy file).
+
+```python
+import hnswlib
+import numpy as np
+
+dim = 384
+n = 1_000_000
+
+# Your vectors (could be mmap'd from disk)
+vectors = np.random.randn(n, dim).astype('float32')
+
+# Build with external vectors
+index = hnswlib.Index(space='cosine', dim=dim)
+index.init_index_graph_only(n, vectors, M=8, ef_construction=200)
+index.add_items(vectors)
+
+# Save graph only (~24x smaller than save_index)
+index.save_graph('index.graph')
+
+# Later: load graph and point to vectors
+index2 = hnswlib.Index(space='cosine', dim=dim)
+index2.load_graph('index.graph')
+index2.set_external_vectors(vectors)
+labels, distances = index2.knn_query(query, k=10)
+```
+
+### FP16 external vectors
+
+When your vectors are stored as float16 (e.g., to save disk space), you can use them directly without converting the entire array to float32:
+
+```python
+# Load fp16 vectors from disk (only 240GB instead of 480GB for 314M x 384)
+vectors_fp16 = np.memmap('vectors.mmap', dtype=np.float16, mode='r',
+                         shape=(n, dim))
+
+# Load graph and set fp16 vectors
+index = hnswlib.Index(space='cosine', dim=dim)
+index.load_graph('index.graph')
+index.set_external_vectors_fp16(vectors_fp16.view(np.uint16))
+
+# Query with fp32 query vectors
+query = np.random.randn(1, dim).astype('float32')
+labels, distances = index.knn_query(query, k=10)
+```
+
+Vectors are converted to fp32 on-the-fly during distance calculations, using thread-local buffers. This adds minimal overhead while halving memory requirements.
+
+### Mmap-backed storage
+
+For building indexes from scratch when even graph construction exceeds RAM, use mmap-backed storage:
+
+```python
+index = hnswlib.Index(space='cosine', dim=dim)
+index.init_index_mmap(n, '/path/to/scratch.mmap', M=8, ef_construction=200)
+index.add_items(vectors)
+index.save_index('index.bin')  # or save_graph for graph-only
+```
+
+This creates a file-backed memory map instead of allocating heap memory.
+
+---
+
+## Original hnswlib features
 
 ### Highlights:
 1) Lightweight, header-only, no dependencies other than C++ 11
@@ -85,6 +154,22 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
     * `allow_replace_deleted` specifies whether the index being loaded has enabled replacing of deleted elements.
       
 * `save_index(path_to_index)` saves the index from persistence.
+
+**Fork-specific methods (mmap and graph-only):**
+
+* `init_index_mmap(max_elements, mmap_path, M = 16, ef_construction = 200, random_seed = 100, allow_replace_deleted = False)` initializes the index using a memory-mapped file instead of heap allocation. Useful when building large indexes that exceed available RAM.
+
+* `init_index_graph_only(max_elements, external_vectors, M = 16, ef_construction = 200, random_seed = 100)` initializes a graph-only index where vectors are stored externally. The `external_vectors` numpy array must remain valid for the lifetime of the index.
+
+* `save_graph(path_to_graph)` saves only the graph structure (links + labels), not vectors. Results in much smaller files.
+
+* `load_graph(path_to_graph)` loads a graph-only index. Must call `set_external_vectors()` afterwards before searching.
+
+* `set_external_vectors(external_vectors)` sets the external vector source (fp32) for a graph-only index.
+
+* `set_external_vectors_fp16(external_vectors)` sets the external vector source in fp16 format. Vectors are converted to fp32 on-the-fly during distance calculations. Pass `array.view(np.uint16)` to this method.
+
+* `load_index_mmap(path_to_index, read_only = True)` loads an existing index using mmap instead of reading into RAM.
 
 * `set_num_threads(num_threads)` set the default number of cpu threads used during data insertion/querying.
   
@@ -242,18 +327,17 @@ print("Recall for two batches:", np.mean(labels.reshape(-1) == np.arange(len(dat
 * epsilon search
 
 
-### Bindings installation
+### Installation
 
-You can install from sources:
+This fork must be installed from source:
+
 ```bash
-apt-get install -y python-setuptools python-pip
-git clone https://github.com/nmslib/hnswlib.git
-cd hnswlib
+git clone https://github.com/adlumal/hnswlib-mmap.git
+cd hnswlib-mmap
 pip install .
 ```
 
-or you can install via pip:
-`pip install hnswlib`
+Note: If you have the original hnswlib installed, this will replace it.
 
 
 ### For developers 

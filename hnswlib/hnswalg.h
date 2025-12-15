@@ -10,9 +10,72 @@
 #include <list>
 #include <memory>
 
+// mmap support
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#include <cstdint>
+#include <cstring>
+
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
+
+// FP16 <-> FP32 conversion utilities
+// IEEE 754 half-precision format
+inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exponent = (h >> 10) & 0x1F;
+    uint32_t mantissa = h & 0x3FF;
+
+    if (exponent == 0) {
+        // Denormalized number or zero
+        if (mantissa == 0) {
+            // Zero
+            uint32_t result = sign;
+            float f;
+            memcpy(&f, &result, sizeof(f));
+            return f;
+        } else {
+            // Denormalized - convert to normalized fp32
+            exponent = 127 - 14;
+            while ((mantissa & 0x400) == 0) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            mantissa &= 0x3FF;
+            uint32_t result = sign | (exponent << 23) | (mantissa << 13);
+            float f;
+            memcpy(&f, &result, sizeof(f));
+            return f;
+        }
+    } else if (exponent == 31) {
+        // Inf or NaN
+        uint32_t result = sign | 0x7F800000 | (mantissa << 13);
+        float f;
+        memcpy(&f, &result, sizeof(f));
+        return f;
+    } else {
+        // Normalized number
+        uint32_t result = sign | ((exponent + 112) << 23) | (mantissa << 13);
+        float f;
+        memcpy(&f, &result, sizeof(f));
+        return f;
+    }
+}
+
+// Convert fp16 vector to fp32 into provided buffer
+inline void fp16_to_fp32_vector(const uint16_t* src, float* dst, size_t dim) {
+    for (size_t i = 0; i < dim; i++) {
+        dst[i] = fp16_to_fp32(src[i]);
+    }
+}
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -52,6 +115,30 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::vector<int> element_levels_;  // keeps level of each element
 
     size_t data_size_{0};
+
+    // mmap support: track whether we're using mmap'd memory
+    bool use_mmap_{false};
+    size_t mmap_size_{0};
+    std::string mmap_path_;
+    char* mmap_base_{nullptr};  // base address of mmap (may differ from data_level0_memory_ if there's a header)
+#ifdef _WIN32
+    HANDLE mmap_file_handle_{INVALID_HANDLE_VALUE};
+    HANDLE mmap_mapping_handle_{nullptr};
+#else
+    int mmap_fd_{-1};
+#endif
+
+    // External vectors mode: don't store vectors in the index, use callback to fetch them
+    bool external_vectors_mode_{false};
+    std::function<const void*(tableint)> get_external_vector_{nullptr};  // callback to get vector by internal id
+    const float* external_vectors_ptr_{nullptr};  // alternative: pointer to contiguous vector array
+    size_t external_vectors_stride_{0};  // stride between vectors (in bytes)
+
+    // FP16 external vectors mode: on-the-fly conversion to fp32
+    bool external_vectors_fp16_mode_{false};
+    const uint16_t* external_vectors_fp16_ptr_{nullptr};  // pointer to fp16 vectors (stored as uint16_t)
+    size_t external_vectors_fp16_stride_{0};  // stride between fp16 vectors (in elements, not bytes)
+    DISTFUNC<dist_t> original_dist_func_{nullptr};  // original distance function (before fp16 wrapper)
 
     DISTFUNC<dist_t> fstdistfunc_;
     void *dist_func_param_{nullptr};
@@ -144,13 +231,315 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    /**
+     * Constructor with mmap-backed storage for large-scale indexes.
+     *
+     * Instead of allocating memory upfront with malloc, this creates a file-backed
+     * mmap that allows building indexes larger than available RAM.
+     *
+     * @param s SpaceInterface for distance computation
+     * @param max_elements Maximum number of elements in the index
+     * @param mmap_path Path to the mmap file (will be created/overwritten)
+     * @param M HNSW M parameter
+     * @param ef_construction Build quality parameter
+     * @param random_seed Random seed for reproducibility
+     * @param allow_replace_deleted Whether to allow replacing deleted elements
+     */
+    HierarchicalNSW(
+        SpaceInterface<dist_t> *s,
+        size_t max_elements,
+        const std::string &mmap_path,
+        size_t M = 16,
+        size_t ef_construction = 200,
+        size_t random_seed = 100,
+        bool allow_replace_deleted = false)
+        : label_op_locks_(MAX_LABEL_OPERATION_LOCKS),
+            link_list_locks_(max_elements),
+            element_levels_(max_elements),
+            allow_replace_deleted_(allow_replace_deleted),
+            use_mmap_(true),
+            mmap_path_(mmap_path) {
+        max_elements_ = max_elements;
+        num_deleted_ = 0;
+        data_size_ = s->get_data_size();
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+        if ( M <= 10000 ) {
+            M_ = M;
+        } else {
+            HNSWERR << "warning: M parameter exceeds 10000 which may lead to adverse effects." << std::endl;
+            HNSWERR << "         Cap to 10000 will be applied for the rest of the processing." << std::endl;
+            M_ = 10000;
+        }
+        maxM_ = M_;
+        maxM0_ = M_ * 2;
+        ef_construction_ = std::max(ef_construction, M_);
+        ef_ = 10;
+
+        level_generator_.seed(random_seed);
+        update_probability_generator_.seed(random_seed + 1);
+
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
+        offsetData_ = size_links_level0_;
+        label_offset_ = size_links_level0_ + data_size_;
+        offsetLevel0_ = 0;
+
+        // Allocate via mmap instead of malloc
+        mmap_size_ = max_elements_ * size_data_per_element_;
+
+#ifdef _WIN32
+        mmap_file_handle_ = CreateFileA(
+            mmap_path.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (mmap_file_handle_ == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("Failed to create mmap file: " + mmap_path);
+
+        // Set file size
+        LARGE_INTEGER file_size;
+        file_size.QuadPart = mmap_size_;
+        if (!SetFilePointerEx(mmap_file_handle_, file_size, nullptr, FILE_BEGIN) ||
+            !SetEndOfFile(mmap_file_handle_))
+            throw std::runtime_error("Failed to set mmap file size");
+
+        mmap_mapping_handle_ = CreateFileMappingA(
+            mmap_file_handle_,
+            nullptr,
+            PAGE_READWRITE,
+            (DWORD)(mmap_size_ >> 32),
+            (DWORD)(mmap_size_ & 0xFFFFFFFF),
+            nullptr);
+        if (mmap_mapping_handle_ == nullptr)
+            throw std::runtime_error("Failed to create file mapping");
+
+        mmap_base_ = (char*)MapViewOfFile(
+            mmap_mapping_handle_,
+            FILE_MAP_ALL_ACCESS,
+            0, 0, mmap_size_);
+        if (mmap_base_ == nullptr)
+            throw std::runtime_error("Failed to map view of file");
+        data_level0_memory_ = mmap_base_;  // No header offset for new index
+#else
+        mmap_fd_ = open(mmap_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (mmap_fd_ < 0)
+            throw std::runtime_error("Failed to create mmap file: " + mmap_path);
+
+        // Set file size
+        if (ftruncate(mmap_fd_, mmap_size_) < 0) {
+            close(mmap_fd_);
+            throw std::runtime_error("Failed to set mmap file size");
+        }
+
+        mmap_base_ = (char*)mmap(
+            nullptr,
+            mmap_size_,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            mmap_fd_,
+            0);
+        if (mmap_base_ == MAP_FAILED) {
+            close(mmap_fd_);
+            mmap_base_ = nullptr;
+            throw std::runtime_error("Failed to mmap file");
+        }
+        data_level0_memory_ = mmap_base_;  // No header offset for new index
+#endif
+
+        cur_element_count = 0;
+
+        visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(1, max_elements));
+
+        // initializations for special treatment of the first node
+        enterpoint_node_ = -1;
+        maxlevel_ = -1;
+
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory: HierarchicalNSW failed to allocate linklists");
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        mult_ = 1 / log(1.0 * M_);
+        revSize_ = 1.0 / mult_;
+    }
+
+
+    /**
+     * Constructor for graph-only / external vectors mode.
+     *
+     * This allocates only the graph structure (links + labels), not vectors.
+     * Vectors are fetched from an external source during build and search.
+     * This dramatically reduces memory usage for large-scale indexes.
+     *
+     * Memory usage: ~68 bytes per element (M=8) instead of ~1612 bytes (M=8, dim=384)
+     *
+     * @param s SpaceInterface for distance computation
+     * @param max_elements Maximum number of elements in the index
+     * @param external_vectors Pointer to contiguous float array of vectors
+     * @param M HNSW M parameter
+     * @param ef_construction Build quality parameter
+     * @param random_seed Random seed for reproducibility
+     * @param allow_replace_deleted Whether to allow replacing deleted elements
+     */
+    HierarchicalNSW(
+        SpaceInterface<dist_t> *s,
+        size_t max_elements,
+        const float* external_vectors,
+        size_t M = 16,
+        size_t ef_construction = 200,
+        size_t random_seed = 100,
+        bool allow_replace_deleted = false)
+        : label_op_locks_(MAX_LABEL_OPERATION_LOCKS),
+            link_list_locks_(max_elements),
+            element_levels_(max_elements),
+            allow_replace_deleted_(allow_replace_deleted),
+            external_vectors_mode_(true),
+            external_vectors_ptr_(external_vectors) {
+        max_elements_ = max_elements;
+        num_deleted_ = 0;
+        data_size_ = s->get_data_size();
+        external_vectors_stride_ = data_size_;  // stride = vector size in bytes
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+        if ( M <= 10000 ) {
+            M_ = M;
+        } else {
+            HNSWERR << "warning: M parameter exceeds 10000 which may lead to adverse effects." << std::endl;
+            HNSWERR << "         Cap to 10000 will be applied for the rest of the processing." << std::endl;
+            M_ = 10000;
+        }
+        maxM_ = M_;
+        maxM0_ = M_ * 2;
+        ef_construction_ = std::max(ef_construction, M_);
+        ef_ = 10;
+
+        level_generator_.seed(random_seed);
+        update_probability_generator_.seed(random_seed + 1);
+
+        // Graph-only: only allocate space for links + labels, NOT vectors
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        // size_data_per_element_ excludes vector data in external mode
+        size_data_per_element_ = size_links_level0_ + sizeof(labeltype);  // NO data_size_!
+        offsetData_ = size_links_level0_;  // kept for compatibility but not used
+        label_offset_ = size_links_level0_;  // label comes right after links
+        offsetLevel0_ = 0;
+
+        // Allocate graph-only storage (much smaller!)
+        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        if (data_level0_memory_ == nullptr)
+            throw std::runtime_error("Not enough memory for graph-only index");
+
+        cur_element_count = 0;
+
+        visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(1, max_elements));
+
+        // initializations for special treatment of the first node
+        enterpoint_node_ = -1;
+        maxlevel_ = -1;
+
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory: HierarchicalNSW failed to allocate linklists");
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        mult_ = 1 / log(1.0 * M_);
+        revSize_ = 1.0 / mult_;
+    }
+
+
+    /**
+     * Set external vector source using a callback function.
+     * Use this when vectors are not in a contiguous array (e.g., mmap'd fp16 with conversion).
+     *
+     * @param get_vector_fn Callback that takes internal_id and returns pointer to vector data
+     */
+    void setExternalVectorCallback(std::function<const void*(tableint)> get_vector_fn) {
+        external_vectors_mode_ = true;
+        get_external_vector_ = get_vector_fn;
+        external_vectors_ptr_ = nullptr;
+    }
+
+
+    /**
+     * Set external vector source using a pointer to contiguous array.
+     *
+     * @param vectors Pointer to first vector
+     * @param stride Stride between vectors in bytes (default: data_size_)
+     */
+    void setExternalVectorPointer(const float* vectors, size_t stride = 0) {
+        external_vectors_mode_ = true;
+        external_vectors_ptr_ = vectors;
+        external_vectors_stride_ = stride > 0 ? stride : data_size_;
+        get_external_vector_ = nullptr;
+        external_vectors_fp16_mode_ = false;
+    }
+
+
+    /**
+     * Set external vector source using a pointer to contiguous fp16 array.
+     * Vectors will be converted to fp32 on-the-fly during distance calculations.
+     *
+     * This is useful when you have fp16 vectors stored on disk (e.g., mmap'd)
+     * and want to avoid doubling memory usage by converting to fp32.
+     *
+     * @param vectors Pointer to first fp16 vector (as uint16_t*)
+     * @param dim Dimension of vectors (number of fp16 elements per vector)
+     */
+    void setExternalVectorPointerFp16(const uint16_t* vectors, size_t dim) {
+        external_vectors_mode_ = true;
+        external_vectors_fp16_mode_ = true;
+        external_vectors_fp16_ptr_ = vectors;
+        external_vectors_fp16_stride_ = dim;  // elements per vector
+        external_vectors_ptr_ = nullptr;
+        get_external_vector_ = nullptr;
+    }
+
+
+    /**
+     * Get fp16 vector and convert to fp32 into the provided buffer.
+     * Used internally when external_vectors_fp16_mode_ is true.
+     *
+     * @param internal_id Internal ID of the vector
+     * @param buffer Pre-allocated buffer to store fp32 result (must be at least data_size_ bytes)
+     */
+    inline void getDataByInternalIdFp16(tableint internal_id, float* buffer) const {
+        const uint16_t* fp16_vec = external_vectors_fp16_ptr_ + internal_id * external_vectors_fp16_stride_;
+        fp16_to_fp32_vector(fp16_vec, buffer, external_vectors_fp16_stride_);
+    }
+
+
     ~HierarchicalNSW() {
         clear();
     }
 
     void clear() {
-        free(data_level0_memory_);
-        data_level0_memory_ = nullptr;
+        if (use_mmap_ && mmap_base_ != nullptr) {
+            // For mmap, we need to unmap from the base address, not data_level0_memory_
+            // (which may be offset by header size)
+#ifdef _WIN32
+            UnmapViewOfFile(mmap_base_);
+            if (mmap_mapping_handle_ != nullptr)
+                CloseHandle(mmap_mapping_handle_);
+            if (mmap_file_handle_ != INVALID_HANDLE_VALUE)
+                CloseHandle(mmap_file_handle_);
+            mmap_mapping_handle_ = nullptr;
+            mmap_file_handle_ = INVALID_HANDLE_VALUE;
+#else
+            munmap(mmap_base_, mmap_size_);
+            if (mmap_fd_ >= 0)
+                close(mmap_fd_);
+            mmap_fd_ = -1;
+#endif
+            mmap_base_ = nullptr;
+            data_level0_memory_ = nullptr;
+            use_mmap_ = false;
+            mmap_size_ = 0;
+        } else if (data_level0_memory_ != nullptr) {
+            free(data_level0_memory_);
+            data_level0_memory_ = nullptr;
+        }
         for (tableint i = 0; i < cur_element_count; i++) {
             if (element_levels_[i] > 0)
                 free(linkLists_[i]);
@@ -200,7 +589,68 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     inline char *getDataByInternalId(tableint internal_id) const {
+        if (external_vectors_mode_) {
+            if (external_vectors_fp16_mode_) {
+                // FP16 mode: caller must use computeDistanceToId() instead
+                // This fallback uses thread-local buffer for compatibility
+                thread_local std::vector<float> fp32_buffer;
+                if (fp32_buffer.size() < external_vectors_fp16_stride_) {
+                    fp32_buffer.resize(external_vectors_fp16_stride_);
+                }
+                getDataByInternalIdFp16(internal_id, fp32_buffer.data());
+                return (char*)fp32_buffer.data();
+            }
+            // External vectors mode: fetch from callback or pointer
+            if (get_external_vector_) {
+                return (char*)get_external_vector_(internal_id);
+            } else if (external_vectors_ptr_) {
+                return (char*)(external_vectors_ptr_ + internal_id * (external_vectors_stride_ / sizeof(float)));
+            } else {
+                throw std::runtime_error("External vectors mode enabled but no vector source set");
+            }
+        }
         return (data_level0_memory_ + internal_id * size_data_per_element_ + offsetData_);
+    }
+
+    /**
+     * Compute distance from a query point to an internal ID.
+     * Handles fp16 conversion transparently using thread-local buffers.
+     *
+     * @param query_data Pointer to query vector (fp32)
+     * @param internal_id Internal ID of target vector
+     * @return Distance between query and target
+     */
+    inline dist_t computeDistanceToId(const void* query_data, tableint internal_id) const {
+        if (external_vectors_fp16_mode_) {
+            // FP16 mode: convert to fp32 using thread-local buffer
+            thread_local std::vector<float> fp32_buffer;
+            if (fp32_buffer.size() < external_vectors_fp16_stride_) {
+                fp32_buffer.resize(external_vectors_fp16_stride_);
+            }
+            getDataByInternalIdFp16(internal_id, fp32_buffer.data());
+            return fstdistfunc_(query_data, fp32_buffer.data(), dist_func_param_);
+        } else {
+            return fstdistfunc_(query_data, getDataByInternalId(internal_id), dist_func_param_);
+        }
+    }
+
+    /**
+     * Compute distance between two internal IDs.
+     * Handles fp16 conversion transparently.
+     */
+    inline dist_t computeDistanceBetweenIds(tableint id1, tableint id2) const {
+        if (external_vectors_fp16_mode_) {
+            thread_local std::vector<float> fp32_buffer1, fp32_buffer2;
+            if (fp32_buffer1.size() < external_vectors_fp16_stride_) {
+                fp32_buffer1.resize(external_vectors_fp16_stride_);
+                fp32_buffer2.resize(external_vectors_fp16_stride_);
+            }
+            getDataByInternalIdFp16(id1, fp32_buffer1.data());
+            getDataByInternalIdFp16(id2, fp32_buffer2.data());
+            return fstdistfunc_(fp32_buffer1.data(), fp32_buffer2.data(), dist_func_param_);
+        } else {
+            return fstdistfunc_(getDataByInternalId(id1), getDataByInternalId(id2), dist_func_param_);
+        }
     }
 
 
@@ -713,6 +1163,163 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    /**
+     * Save only the graph structure (links + labels), not vectors.
+     * Use this when you want to store a minimal index and load vectors externally.
+     *
+     * File format:
+     *   - Header: metadata fields
+     *   - Level 0 data: links + labels for each element (NO vectors)
+     *   - Higher level links
+     *
+     * The saved file can be loaded with loadGraph().
+     */
+    void saveGraph(const std::string &location) {
+        std::ofstream output(location, std::ios::binary);
+
+        // Write header with graph-only flag
+        uint32_t magic = 0x47524150;  // "GRAP" magic number for graph-only format
+        writeBinaryPOD(output, magic);
+        writeBinaryPOD(output, max_elements_);
+        writeBinaryPOD(output, cur_element_count);
+        writeBinaryPOD(output, M_);
+        writeBinaryPOD(output, maxM_);
+        writeBinaryPOD(output, maxM0_);
+        writeBinaryPOD(output, ef_construction_);
+        writeBinaryPOD(output, mult_);
+        writeBinaryPOD(output, maxlevel_);
+        writeBinaryPOD(output, enterpoint_node_);
+        writeBinaryPOD(output, data_size_);  // original vector size (for validation)
+
+        // Calculate graph-only size per element (links + label, no vector)
+        size_t graph_element_size = size_links_level0_ + sizeof(labeltype);
+
+        // Write level 0 graph data (links + labels only)
+        for (size_t i = 0; i < cur_element_count; i++) {
+            // Write links
+            char* element_data = data_level0_memory_ + i * size_data_per_element_;
+            output.write(element_data, size_links_level0_);  // links
+
+            // Write label
+            labeltype label = getExternalLabel(i);
+            writeBinaryPOD(output, label);
+        }
+
+        // Write higher level links
+        for (size_t i = 0; i < cur_element_count; i++) {
+            unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+            writeBinaryPOD(output, linkListSize);
+            if (linkListSize)
+                output.write(linkLists_[i], linkListSize);
+        }
+
+        output.close();
+    }
+
+
+    /**
+     * Load a graph-only index. Vectors must be provided externally.
+     *
+     * After loading, call setExternalVectorPointer() or setExternalVectorCallback()
+     * to provide vectors for search.
+     *
+     * @param location Path to the graph file saved with saveGraph()
+     * @param s SpaceInterface for distance computation
+     */
+    void loadGraph(const std::string &location, SpaceInterface<dist_t> *s) {
+        std::ifstream input(location, std::ios::binary);
+        if (!input.is_open())
+            throw std::runtime_error("Cannot open graph file");
+
+        clear();
+
+        // Read and verify header
+        uint32_t magic;
+        readBinaryPOD(input, magic);
+        if (magic != 0x47524150)
+            throw std::runtime_error("Invalid graph file format (bad magic number)");
+
+        readBinaryPOD(input, max_elements_);
+        size_t saved_count;
+        readBinaryPOD(input, saved_count);
+        readBinaryPOD(input, M_);
+        readBinaryPOD(input, maxM_);
+        readBinaryPOD(input, maxM0_);
+        readBinaryPOD(input, ef_construction_);
+        readBinaryPOD(input, mult_);
+        readBinaryPOD(input, maxlevel_);
+        readBinaryPOD(input, enterpoint_node_);
+        size_t saved_data_size;
+        readBinaryPOD(input, saved_data_size);
+
+        // Initialize from SpaceInterface
+        data_size_ = s->get_data_size();
+        if (data_size_ != saved_data_size) {
+            throw std::runtime_error("Vector dimension mismatch: saved graph expects " +
+                std::to_string(saved_data_size / sizeof(float)) + " dims, got " +
+                std::to_string(data_size_ / sizeof(float)));
+        }
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+
+        // Set up graph-only mode
+        external_vectors_mode_ = true;
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_data_per_element_ = size_links_level0_ + sizeof(labeltype);  // NO vector!
+        label_offset_ = size_links_level0_;
+        offsetData_ = size_links_level0_;
+        offsetLevel0_ = 0;
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+
+        // Allocate graph-only storage
+        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        if (data_level0_memory_ == nullptr)
+            throw std::runtime_error("Not enough memory for graph");
+
+        // Read level 0 data (links + labels)
+        for (size_t i = 0; i < saved_count; i++) {
+            char* element_data = data_level0_memory_ + i * size_data_per_element_;
+            input.read(element_data, size_links_level0_);  // links
+
+            labeltype label;
+            readBinaryPOD(input, label);
+            memcpy(element_data + label_offset_, &label, sizeof(labeltype));
+
+            label_lookup_[label] = i;
+        }
+
+        // Allocate and read higher level links
+        std::vector<std::mutex>(max_elements_).swap(link_list_locks_);
+        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory for linklists");
+        element_levels_ = std::vector<int>(max_elements_);
+
+        for (size_t i = 0; i < saved_count; i++) {
+            unsigned int linkListSize;
+            readBinaryPOD(input, linkListSize);
+            if (linkListSize == 0) {
+                element_levels_[i] = 0;
+                linkLists_[i] = nullptr;
+            } else {
+                element_levels_[i] = linkListSize / size_links_per_element_;
+                linkLists_[i] = (char *) malloc(linkListSize);
+                if (linkLists_[i] == nullptr)
+                    throw std::runtime_error("Not enough memory for linklist");
+                input.read(linkLists_[i], linkListSize);
+            }
+        }
+
+        cur_element_count = saved_count;
+        visited_list_pool_.reset(new VisitedListPool(1, max_elements_));
+
+        input.close();
+    }
+
+
     void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
         std::ifstream input(location, std::ios::binary);
 
@@ -819,6 +1426,159 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         input.close();
 
         return;
+    }
+
+
+    /**
+     * Load an existing index using mmap for read-only access.
+     *
+     * This mmaps the index file directly, avoiding the need to read it into RAM.
+     * Useful for very large indexes where you want to rely on OS paging.
+     *
+     * Note: The entire file is mmapped, including the header. The data_level0_memory_
+     * pointer is adjusted to skip the header bytes.
+     *
+     * @param location Path to the index file
+     * @param s SpaceInterface for distance computation
+     * @param read_only If true, map as read-only (default). If false, map read-write.
+     */
+    void loadIndexMmap(const std::string &location, SpaceInterface<dist_t> *s, bool read_only = true) {
+        clear();
+
+        // First, read just the header to get metadata
+        std::ifstream input(location, std::ios::binary);
+        if (!input.is_open())
+            throw std::runtime_error("Cannot open file");
+
+        // Get file size
+        input.seekg(0, input.end);
+        std::streampos total_filesize = input.tellg();
+        input.seekg(0, input.beg);
+
+        readBinaryPOD(input, offsetLevel0_);
+        readBinaryPOD(input, max_elements_);
+        readBinaryPOD(input, cur_element_count);
+        readBinaryPOD(input, size_data_per_element_);
+        readBinaryPOD(input, label_offset_);
+        readBinaryPOD(input, offsetData_);
+        readBinaryPOD(input, maxlevel_);
+        readBinaryPOD(input, enterpoint_node_);
+        readBinaryPOD(input, maxM_);
+        readBinaryPOD(input, maxM0_);
+        readBinaryPOD(input, M_);
+        readBinaryPOD(input, mult_);
+        readBinaryPOD(input, ef_construction_);
+
+        size_t header_size = input.tellg();
+
+        data_size_ = s->get_data_size();
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+
+        // mmap the entire file
+        use_mmap_ = true;
+        mmap_path_ = location;
+        mmap_size_ = (size_t)total_filesize;
+
+#ifdef _WIN32
+        mmap_file_handle_ = CreateFileA(
+            location.c_str(),
+            read_only ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE),
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (mmap_file_handle_ == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("Failed to open file for mmap: " + location);
+
+        mmap_mapping_handle_ = CreateFileMappingA(
+            mmap_file_handle_,
+            nullptr,
+            read_only ? PAGE_READONLY : PAGE_READWRITE,
+            0, 0,
+            nullptr);
+        if (mmap_mapping_handle_ == nullptr) {
+            CloseHandle(mmap_file_handle_);
+            throw std::runtime_error("Failed to create file mapping");
+        }
+
+        mmap_base_ = (char*)MapViewOfFile(
+            mmap_mapping_handle_,
+            read_only ? FILE_MAP_READ : FILE_MAP_ALL_ACCESS,
+            0, 0, 0);
+        if (mmap_base_ == nullptr) {
+            CloseHandle(mmap_mapping_handle_);
+            CloseHandle(mmap_file_handle_);
+            throw std::runtime_error("Failed to map view of file");
+        }
+#else
+        mmap_fd_ = open(location.c_str(), read_only ? O_RDONLY : O_RDWR);
+        if (mmap_fd_ < 0)
+            throw std::runtime_error("Failed to open file for mmap: " + location);
+
+        mmap_base_ = (char*)mmap(
+            nullptr,
+            mmap_size_,
+            read_only ? PROT_READ : (PROT_READ | PROT_WRITE),
+            MAP_SHARED,
+            mmap_fd_,
+            0);
+        if (mmap_base_ == MAP_FAILED) {
+            close(mmap_fd_);
+            mmap_fd_ = -1;
+            mmap_base_ = nullptr;
+            throw std::runtime_error("Failed to mmap file");
+        }
+#endif
+
+        // Point data_level0_memory_ past the header
+        data_level0_memory_ = mmap_base_ + header_size;
+
+        // Now read the higher level links from the file (after level0 data)
+        // These are stored after data_level0, so we need to seek there
+        size_t level0_data_size = (size_t)cur_element_count * size_data_per_element_;
+        input.seekg(header_size + level0_data_size, input.beg);
+
+        std::vector<std::mutex>(max_elements_).swap(link_list_locks_);
+        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
+
+        visited_list_pool_.reset(new VisitedListPool(1, max_elements_));
+
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory: loadIndexMmap failed to allocate linklists");
+        element_levels_ = std::vector<int>(max_elements_);
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+
+        for (size_t i = 0; i < cur_element_count; i++) {
+            label_lookup_[getExternalLabel(i)] = i;
+            unsigned int linkListSize;
+            readBinaryPOD(input, linkListSize);
+            if (linkListSize == 0) {
+                element_levels_[i] = 0;
+                linkLists_[i] = nullptr;
+            } else {
+                element_levels_[i] = linkListSize / size_links_per_element_;
+                linkLists_[i] = (char *) malloc(linkListSize);
+                if (linkLists_[i] == nullptr)
+                    throw std::runtime_error("Not enough memory: loadIndexMmap failed to allocate linklist");
+                input.read(linkLists_[i], linkListSize);
+            }
+        }
+
+        for (size_t i = 0; i < cur_element_count; i++) {
+            if (isMarkedDeleted(i)) {
+                num_deleted_ += 1;
+                if (allow_replace_deleted_) deleted_elements.insert(i);
+            }
+        }
+
+        input.close();
     }
 
 

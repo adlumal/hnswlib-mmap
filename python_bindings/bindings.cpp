@@ -238,6 +238,180 @@ class Index {
     }
 
 
+    /**
+     * Initialize a new index with mmap-backed storage.
+     *
+     * This creates a file-backed mmap instead of allocating memory with malloc,
+     * allowing you to build indexes larger than available RAM.
+     *
+     * @param maxElements Maximum number of elements in the index
+     * @param mmap_path Path to the mmap file (will be created/overwritten)
+     * @param M HNSW M parameter
+     * @param efConstruction Build quality parameter
+     * @param random_seed Random seed for reproducibility
+     * @param allow_replace_deleted Whether to allow replacing deleted elements
+     */
+    void init_new_index_mmap(
+        size_t maxElements,
+        const std::string &mmap_path,
+        size_t M,
+        size_t efConstruction,
+        size_t random_seed,
+        bool allow_replace_deleted) {
+        if (appr_alg) {
+            throw std::runtime_error("The index is already initiated.");
+        }
+        cur_l = 0;
+        appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, maxElements, mmap_path, M, efConstruction, random_seed, allow_replace_deleted);
+        index_inited = true;
+        ep_added = false;
+        appr_alg->ef_ = default_ef;
+        seed = random_seed;
+    }
+
+
+    /**
+     * Load an existing index using mmap for read-only access.
+     *
+     * This mmaps the index file directly instead of reading it into RAM,
+     * useful for very large indexes where you want to rely on OS paging.
+     *
+     * @param path_to_index Path to the index file
+     * @param read_only If true, map as read-only (default). If false, map read-write.
+     */
+    void loadIndexMmap(const std::string &path_to_index, bool read_only = true) {
+      if (appr_alg) {
+          std::cerr << "Warning: Calling load_index_mmap for an already inited index. Old index is being deallocated." << std::endl;
+          delete appr_alg;
+      }
+      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space);
+      appr_alg->loadIndexMmap(path_to_index, l2space, read_only);
+      cur_l = appr_alg->cur_element_count;
+      index_inited = true;
+    }
+
+
+    /**
+     * Initialize a graph-only index with external vectors.
+     *
+     * This allocates only the graph structure (~68 bytes/element for M=8)
+     * instead of graph + vectors (~1612 bytes/element for M=8, dim=384).
+     * Vectors are fetched from the provided numpy array during build and search.
+     *
+     * @param maxElements Maximum number of elements
+     * @param external_vectors Numpy array of shape (max_elements, dim) containing all vectors
+     * @param M HNSW M parameter
+     * @param efConstruction Build quality parameter
+     * @param random_seed Random seed
+     */
+    void init_graph_only(
+        size_t maxElements,
+        py::array_t<float, py::array::c_style | py::array::forcecast> external_vectors,
+        size_t M,
+        size_t efConstruction,
+        size_t random_seed) {
+        if (appr_alg) {
+            throw std::runtime_error("The index is already initiated.");
+        }
+
+        auto buffer = external_vectors.request();
+        if (buffer.ndim != 2) {
+            throw std::runtime_error("External vectors must be a 2D array");
+        }
+        if (buffer.shape[1] != dim) {
+            throw std::runtime_error("External vectors dimension mismatch");
+        }
+
+        cur_l = 0;
+        const float* vectors_ptr = static_cast<const float*>(buffer.ptr);
+        appr_alg = new hnswlib::HierarchicalNSW<dist_t>(
+            l2space, maxElements, vectors_ptr, M, efConstruction, random_seed, false);
+        index_inited = true;
+        ep_added = false;
+        appr_alg->ef_ = default_ef;
+        seed = random_seed;
+    }
+
+
+    /**
+     * Set external vectors for an existing graph-only index.
+     * Use this after loading a graph with load_graph().
+     */
+    void set_external_vectors(py::array_t<float, py::array::c_style | py::array::forcecast> external_vectors) {
+        if (!appr_alg) {
+            throw std::runtime_error("Index not initialized");
+        }
+
+        auto buffer = external_vectors.request();
+        if (buffer.ndim != 2) {
+            throw std::runtime_error("External vectors must be a 2D array");
+        }
+        if (buffer.shape[1] != dim) {
+            throw std::runtime_error("External vectors dimension mismatch");
+        }
+
+        const float* vectors_ptr = static_cast<const float*>(buffer.ptr);
+        appr_alg->setExternalVectorPointer(vectors_ptr, dim * sizeof(float));
+    }
+
+
+    /**
+     * Set external vectors in fp16 format.
+     * Vectors will be converted to fp32 on-the-fly during distance calculations.
+     *
+     * This is useful when you have fp16 vectors mmap'd from disk and want to avoid
+     * doubling memory usage by converting the entire array to fp32.
+     *
+     * Note: The numpy array must have dtype=float16 and remain valid for the
+     * lifetime of the index.
+     */
+    void set_external_vectors_fp16(py::array_t<uint16_t, py::array::c_style> external_vectors) {
+        if (!appr_alg) {
+            throw std::runtime_error("Index not initialized");
+        }
+
+        auto buffer = external_vectors.request();
+        if (buffer.ndim != 2) {
+            throw std::runtime_error("External vectors must be a 2D array");
+        }
+        if (buffer.shape[1] != dim) {
+            throw std::runtime_error("External vectors dimension mismatch (got " +
+                                     std::to_string(buffer.shape[1]) + ", expected " +
+                                     std::to_string(dim) + ")");
+        }
+
+        const uint16_t* vectors_ptr = static_cast<const uint16_t*>(buffer.ptr);
+        appr_alg->setExternalVectorPointerFp16(vectors_ptr, dim);
+    }
+
+
+    /**
+     * Save only the graph structure (no vectors).
+     * The resulting file is much smaller than save_index().
+     */
+    void saveGraph(const std::string &path_to_graph) {
+        if (!appr_alg) {
+            throw std::runtime_error("Index not initialized");
+        }
+        appr_alg->saveGraph(path_to_graph);
+    }
+
+
+    /**
+     * Load a graph-only index. Call set_external_vectors() afterwards to provide vectors.
+     */
+    void loadGraph(const std::string &path_to_graph) {
+        if (appr_alg) {
+            std::cerr << "Warning: Calling load_graph for an already inited index. Old index is being deallocated." << std::endl;
+            delete appr_alg;
+        }
+        appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space);
+        appr_alg->loadGraph(path_to_graph, l2space);
+        cur_l = appr_alg->cur_element_count;
+        index_inited = true;
+    }
+
+
     void normalize_vector(float* data, float* norm_array) {
         float norm = 0.0f;
         for (int i = 0; i < dim; i++)
@@ -945,6 +1119,142 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("path_to_index"),
             py::arg("max_elements") = 0,
             py::arg("allow_replace_deleted") = false)
+        .def("init_index_mmap",
+            &Index<float>::init_new_index_mmap,
+            py::arg("max_elements"),
+            py::arg("mmap_path"),
+            py::arg("M") = 16,
+            py::arg("ef_construction") = 200,
+            py::arg("random_seed") = 100,
+            py::arg("allow_replace_deleted") = false,
+            R"pbdoc(
+            Initialize a new index with mmap-backed storage.
+
+            This creates a file-backed mmap instead of allocating memory with malloc,
+            allowing you to build indexes larger than available RAM.
+
+            Args:
+                max_elements: Maximum number of elements in the index
+                mmap_path: Path to the mmap file (will be created/overwritten)
+                M: HNSW M parameter (default: 16)
+                ef_construction: Build quality parameter (default: 200)
+                random_seed: Random seed for reproducibility (default: 100)
+                allow_replace_deleted: Whether to allow replacing deleted elements (default: False)
+            )pbdoc")
+        .def("load_index_mmap",
+            &Index<float>::loadIndexMmap,
+            py::arg("path_to_index"),
+            py::arg("read_only") = true,
+            R"pbdoc(
+            Load an existing index using mmap for read-only access.
+
+            This mmaps the index file directly instead of reading it into RAM,
+            useful for very large indexes where you want to rely on OS paging.
+
+            Args:
+                path_to_index: Path to the index file
+                read_only: If True, map as read-only (default). If False, map read-write.
+            )pbdoc")
+        .def("init_index_graph_only",
+            &Index<float>::init_graph_only,
+            py::arg("max_elements"),
+            py::arg("external_vectors"),
+            py::arg("M") = 16,
+            py::arg("ef_construction") = 200,
+            py::arg("random_seed") = 100,
+            R"pbdoc(
+            Initialize a graph-only index with external vectors.
+
+            This allocates only the graph structure (~68 bytes/element for M=8)
+            instead of graph + vectors (~1612 bytes/element for M=8, dim=384).
+            Memory savings: ~96% for dim=384!
+
+            Vectors are fetched from the provided numpy array during build and search.
+            The array must stay valid for the lifetime of the index.
+
+            Args:
+                max_elements: Maximum number of elements in the index
+                external_vectors: Numpy array of shape (max_elements, dim) with all vectors
+                M: HNSW M parameter (default: 16)
+                ef_construction: Build quality parameter (default: 200)
+                random_seed: Random seed for reproducibility (default: 100)
+
+            Example:
+                vectors = np.random.randn(1000000, 384).astype('float32')
+                index = hnswlib.Index(space='cosine', dim=384)
+                index.init_index_graph_only(1000000, vectors, M=8)
+                index.add_items(vectors)  # vectors already set, just builds graph
+                index.save_graph('wiki.graph')  # ~21GB instead of ~500GB!
+            )pbdoc")
+        .def("set_external_vectors",
+            &Index<float>::set_external_vectors,
+            py::arg("external_vectors"),
+            R"pbdoc(
+            Set external vectors for a graph-only index.
+
+            Use this after loading a graph with load_graph() to provide the vectors
+            needed for search.
+
+            Args:
+                external_vectors: Numpy array of shape (n_elements, dim), dtype=float32
+            )pbdoc")
+        .def("set_external_vectors_fp16",
+            &Index<float>::set_external_vectors_fp16,
+            py::arg("external_vectors"),
+            R"pbdoc(
+            Set external vectors in fp16 format for a graph-only index.
+
+            Vectors will be converted to fp32 on-the-fly during distance calculations.
+            This is useful when you have fp16 vectors mmap'd from disk and want to avoid
+            doubling memory usage by converting the entire array to fp32.
+
+            Args:
+                external_vectors: Numpy array of shape (n_elements, dim), dtype=float16
+                                  Pass the array.view(np.uint16) to this method.
+
+            Example:
+                # Load fp16 vectors from mmap
+                vectors_fp16 = np.memmap('vectors.mmap', dtype=np.float16, mode='r',
+                                         shape=(n_elements, dim))
+
+                index = hnswlib.Index(space='cosine', dim=dim)
+                index.load_graph('wiki.graph')
+                index.set_external_vectors_fp16(vectors_fp16.view(np.uint16))
+                labels, distances = index.knn_query(query, k=10)  # query must be fp32
+            )pbdoc")
+        .def("save_graph",
+            &Index<float>::saveGraph,
+            py::arg("path_to_graph"),
+            R"pbdoc(
+            Save only the graph structure (no vectors).
+
+            The resulting file is MUCH smaller than save_index():
+            - save_index: ~500GB for 314M vectors, dim=384, M=8
+            - save_graph: ~21GB for the same index
+
+            Load with load_graph() and call set_external_vectors() to provide vectors.
+
+            Args:
+                path_to_graph: Path to save the graph file
+            )pbdoc")
+        .def("load_graph",
+            &Index<float>::loadGraph,
+            py::arg("path_to_graph"),
+            R"pbdoc(
+            Load a graph-only index saved with save_graph().
+
+            After loading, you MUST call set_external_vectors() to provide the vectors
+            before searching.
+
+            Args:
+                path_to_graph: Path to the graph file
+
+            Example:
+                index = hnswlib.Index(space='cosine', dim=384)
+                index.load_graph('wiki.graph')
+                index.set_external_vectors(my_vectors)  # mmap'd numpy array
+                labels, distances = index.knn_query(query, k=10)
+            )pbdoc")
         .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))
