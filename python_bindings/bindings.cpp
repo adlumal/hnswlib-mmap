@@ -1081,6 +1081,264 @@ class BFIndex {
 };
 
 
+/**
+ * ShardedIndex - Python wrapper for building and searching sharded HNSW indexes.
+ *
+ * This enables building indexes larger than available RAM by splitting data into
+ * multiple shards, each built independently.
+ */
+template<typename dist_t, typename data_t = float>
+class ShardedIndexPy {
+public:
+    std::string space_name;
+    int dim;
+    bool normalize;
+    int num_threads_default;
+    size_t default_ef;
+
+    hnswlib::SpaceInterface<float>* space;
+    std::unique_ptr<hnswlib::ShardedIndex<dist_t>> sharded_index;
+    size_t n_shards;
+    size_t total_elements;
+
+    ShardedIndexPy(const std::string& space_name, int dim)
+        : space_name(space_name), dim(dim), n_shards(0), total_elements(0) {
+        normalize = false;
+        if (space_name == "l2") {
+            space = new hnswlib::L2Space(dim);
+        } else if (space_name == "ip") {
+            space = new hnswlib::InnerProductSpace(dim);
+        } else if (space_name == "cosine") {
+            space = new hnswlib::InnerProductSpace(dim);
+            normalize = true;
+        } else {
+            throw std::runtime_error("Space name must be one of l2, ip, or cosine.");
+        }
+        sharded_index = std::make_unique<hnswlib::ShardedIndex<dist_t>>(space, dim);
+        num_threads_default = std::thread::hardware_concurrency();
+        default_ef = 50;
+    }
+
+    ~ShardedIndexPy() {
+        sharded_index.reset();
+        delete space;
+    }
+
+    void set_ef(size_t ef) {
+        default_ef = ef;
+        if (n_shards > 0) {
+            sharded_index->setEf(ef);
+        }
+    }
+
+    void set_num_threads(int num_threads) {
+        num_threads_default = num_threads;
+    }
+
+    void normalize_vector(float* data, float* norm_array) {
+        float norm = 0.0f;
+        for (int i = 0; i < dim; i++)
+            norm += data[i] * data[i];
+        norm = 1.0f / (sqrtf(norm) + 1e-30f);
+        for (int i = 0; i < dim; i++)
+            norm_array[i] = data[i] * norm;
+    }
+
+    /**
+     * Build a single shard of the index.
+     *
+     * Call this once per shard, with only that shard's vectors loaded in RAM.
+     */
+    void buildShard(
+        py::array_t<float, py::array::c_style | py::array::forcecast> vectors,
+        const std::string& output_dir,
+        size_t shard_idx,
+        size_t start_idx,
+        size_t M = 8,
+        size_t ef_construction = 200,
+        int num_threads = -1
+    ) {
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        auto buffer = vectors.request();
+        if (buffer.ndim != 2) {
+            throw std::runtime_error("Vectors must be a 2D array");
+        }
+        if (buffer.shape[1] != dim) {
+            throw std::runtime_error("Vector dimension mismatch");
+        }
+
+        size_t n_elements = buffer.shape[0];
+        const float* vectors_ptr = static_cast<const float*>(buffer.ptr);
+
+        // If normalizing, we need to make a copy
+        std::vector<float> normalized;
+        if (normalize) {
+            normalized.resize(n_elements * dim);
+            for (size_t i = 0; i < n_elements; i++) {
+                normalize_vector(const_cast<float*>(vectors_ptr + i * dim),
+                                normalized.data() + i * dim);
+            }
+            vectors_ptr = normalized.data();
+        }
+
+        py::gil_scoped_release release;
+        sharded_index->buildShard(
+            vectors_ptr, n_elements, output_dir, shard_idx, start_idx,
+            M, ef_construction, num_threads
+        );
+    }
+
+    /**
+     * Save global index metadata after all shards are built.
+     */
+    void saveMetadata(
+        const std::string& output_dir,
+        size_t n_shards,
+        size_t total_elements,
+        size_t M,
+        size_t ef_construction
+    ) {
+        sharded_index->saveMetadata(
+            output_dir, n_shards, total_elements, dim, M, ef_construction, space_name
+        );
+        this->n_shards = n_shards;
+        this->total_elements = total_elements;
+    }
+
+    /**
+     * Load all shards for search with fp32 vectors.
+     */
+    void loadShards(
+        const std::string& output_dir,
+        py::array_t<float, py::array::c_style | py::array::forcecast> external_vectors,
+        size_t n_shards
+    ) {
+        auto buffer = external_vectors.request();
+        if (buffer.ndim != 2) {
+            throw std::runtime_error("External vectors must be a 2D array");
+        }
+        if (buffer.shape[1] != dim) {
+            throw std::runtime_error("Vector dimension mismatch");
+        }
+
+        const float* vectors_ptr = static_cast<const float*>(buffer.ptr);
+        total_elements = buffer.shape[0];
+
+        py::gil_scoped_release release;
+        sharded_index->loadShards(output_dir, vectors_ptr, n_shards);
+        sharded_index->setEf(default_ef);
+        this->n_shards = n_shards;
+    }
+
+    /**
+     * Load all shards for search with fp16 vectors.
+     */
+    void loadShardsFp16(
+        const std::string& output_dir,
+        py::array_t<uint16_t, py::array::c_style> external_vectors,
+        size_t n_shards
+    ) {
+        auto buffer = external_vectors.request();
+        if (buffer.ndim != 2) {
+            throw std::runtime_error("External vectors must be a 2D array");
+        }
+        if (buffer.shape[1] != dim) {
+            throw std::runtime_error("Vector dimension mismatch");
+        }
+
+        const uint16_t* vectors_ptr = static_cast<const uint16_t*>(buffer.ptr);
+        total_elements = buffer.shape[0];
+
+        py::gil_scoped_release release;
+        sharded_index->loadShardsFp16(output_dir, vectors_ptr, n_shards);
+        sharded_index->setEf(default_ef);
+        this->n_shards = n_shards;
+    }
+
+    /**
+     * Search across all shards.
+     */
+    py::object knnQuery(
+        py::object input,
+        size_t k = 1,
+        int num_threads = -1
+    ) {
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (features != (size_t)dim) {
+            throw std::runtime_error("Query dimension mismatch");
+        }
+
+        hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
+        dist_t* data_numpy_d = new dist_t[rows * k];
+
+        {
+            py::gil_scoped_release release;
+
+            if (normalize) {
+                std::vector<float> norm_array(num_threads * dim);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * dim;
+                    normalize_vector(const_cast<float*>(static_cast<const float*>(items.data(row))),
+                                    norm_array.data() + start_idx);
+
+                    auto result = sharded_index->searchKnn(
+                        (void*)(norm_array.data() + start_idx), k);
+
+                    size_t i = k - 1;
+                    while (!result.empty() && i < k) {
+                        auto& top = result.top();
+                        data_numpy_d[row * k + i] = top.first;
+                        data_numpy_l[row * k + i] = top.second;
+                        result.pop();
+                        i--;
+                    }
+                });
+            } else {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    auto result = sharded_index->searchKnn(
+                        (void*)items.data(row), k);
+
+                    size_t i = k - 1;
+                    while (!result.empty() && i < k) {
+                        auto& top = result.top();
+                        data_numpy_d[row * k + i] = top.first;
+                        data_numpy_l[row * k + i] = top.second;
+                        result.pop();
+                        i--;
+                    }
+                });
+            }
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                { rows, k },
+                { k * sizeof(hnswlib::labeltype), sizeof(hnswlib::labeltype) },
+                data_numpy_l,
+                free_when_done_l),
+            py::array_t<dist_t>(
+                { rows, k },
+                { k * sizeof(dist_t), sizeof(dist_t) },
+                data_numpy_d,
+                free_when_done_d));
+    }
+
+    size_t getTotalElements() const { return total_elements; }
+    size_t getNumShards() const { return n_shards; }
+};
+
+
 PYBIND11_PLUGIN(hnswlib) {
         py::module m("hnswlib");
 
@@ -1319,5 +1577,158 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_max_elements", &BFIndex<float>::getMaxElements)
         .def("get_current_count", &BFIndex<float>::getCurrentCount)
         .def_readwrite("num_threads", &BFIndex<float>::num_threads_default);
+
+        py::class_<ShardedIndexPy<float>>(m, "ShardedIndex")
+        .def(py::init<const std::string &, const int>(), py::arg("space"), py::arg("dim"),
+            R"pbdoc(
+            Create a sharded HNSW index for large-scale vector search.
+
+            Sharding enables building indexes larger than available RAM by splitting
+            the data into multiple smaller indexes (shards) that are built independently.
+
+            For 314M vectors with 1536 dimensions:
+            - Full index would need ~480GB RAM during build
+            - With 32 shards of ~10M vectors each: ~15GB RAM per shard
+
+            Args:
+                space: Distance metric ('l2', 'ip', or 'cosine')
+                dim: Vector dimension
+
+            Example (building shards):
+                import hnswlib
+                import numpy as np
+
+                index = hnswlib.ShardedIndex('cosine', dim=1536)
+
+                # Build shards one at a time
+                for shard_idx in range(n_shards):
+                    start = shard_idx * shard_size
+                    end = min(start + shard_size, n_total)
+
+                    # Load only this shard's vectors
+                    shard_vectors = load_vectors(start, end)  # ~15GB RAM
+                    index.build_shard(shard_vectors, 'index_dir/', shard_idx, start,
+                                      M=8, ef_construction=200)
+
+                index.save_metadata('index_dir/', n_shards, n_total, M=8, ef_construction=200)
+
+            Example (searching):
+                index = hnswlib.ShardedIndex('cosine', dim=1536)
+
+                # Load all vectors as mmap (no RAM used for vectors)
+                vectors = np.memmap('vectors.mmap', dtype=np.float16, mode='r',
+                                    shape=(n_total, dim))
+                index.load_shards_fp16('index_dir/', vectors.view(np.uint16), n_shards)
+
+                index.set_ef(50)
+                labels, distances = index.knn_query(query, k=10)
+            )pbdoc")
+        .def("build_shard",
+            &ShardedIndexPy<float>::buildShard,
+            py::arg("vectors"),
+            py::arg("output_dir"),
+            py::arg("shard_idx"),
+            py::arg("start_idx"),
+            py::arg("M") = 8,
+            py::arg("ef_construction") = 200,
+            py::arg("num_threads") = -1,
+            R"pbdoc(
+            Build a single shard of the index.
+
+            Call once per shard, loading only that shard's vectors into RAM.
+            The graph is saved to disk immediately.
+
+            Args:
+                vectors: Numpy array of shape (n_elements, dim), dtype=float32
+                output_dir: Directory to save shard graphs
+                shard_idx: Index of this shard (0, 1, 2, ...)
+                start_idx: Global starting index for element IDs
+                M: HNSW M parameter (default: 8)
+                ef_construction: Build quality parameter (default: 200)
+                num_threads: Number of threads for building (default: all CPUs)
+            )pbdoc")
+        .def("save_metadata",
+            &ShardedIndexPy<float>::saveMetadata,
+            py::arg("output_dir"),
+            py::arg("n_shards"),
+            py::arg("total_elements"),
+            py::arg("M"),
+            py::arg("ef_construction"),
+            R"pbdoc(
+            Save global index metadata after all shards are built.
+
+            Args:
+                output_dir: Directory containing shard graphs
+                n_shards: Total number of shards
+                total_elements: Total number of vectors across all shards
+                M: HNSW M parameter used during build
+                ef_construction: Build quality parameter used during build
+            )pbdoc")
+        .def("load_shards",
+            &ShardedIndexPy<float>::loadShards,
+            py::arg("output_dir"),
+            py::arg("external_vectors"),
+            py::arg("n_shards"),
+            R"pbdoc(
+            Load all shards for search with fp32 vectors.
+
+            Args:
+                output_dir: Directory containing shard graphs
+                external_vectors: Numpy array of all vectors, shape (n_total, dim), dtype=float32
+                n_shards: Number of shards to load
+            )pbdoc")
+        .def("load_shards_fp16",
+            &ShardedIndexPy<float>::loadShardsFp16,
+            py::arg("output_dir"),
+            py::arg("external_vectors"),
+            py::arg("n_shards"),
+            R"pbdoc(
+            Load all shards for search with fp16 vectors.
+
+            Vectors are converted to fp32 on-the-fly during search. This halves
+            memory usage compared to fp32.
+
+            Args:
+                output_dir: Directory containing shard graphs
+                external_vectors: Numpy array as uint16 view of float16 data.
+                                  Pass your_fp16_array.view(np.uint16)
+                n_shards: Number of shards to load
+            )pbdoc")
+        .def("knn_query",
+            &ShardedIndexPy<float>::knnQuery,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("num_threads") = -1,
+            R"pbdoc(
+            Search across all shards and return top-k results.
+
+            Results are returned with global element indices (not shard-local).
+
+            Args:
+                data: Query vector(s), shape (n_queries, dim) or (dim,)
+                k: Number of results per query
+                num_threads: Number of threads (default: all CPUs)
+
+            Returns:
+                Tuple of (labels, distances), each shape (n_queries, k)
+            )pbdoc")
+        .def("set_ef", &ShardedIndexPy<float>::set_ef, py::arg("ef"),
+            R"pbdoc(Set ef search parameter for all shards.)pbdoc")
+        .def("set_num_threads", &ShardedIndexPy<float>::set_num_threads, py::arg("num_threads"))
+        .def("get_total_elements", &ShardedIndexPy<float>::getTotalElements)
+        .def("get_num_shards", &ShardedIndexPy<float>::getNumShards)
+        .def_readonly("space", &ShardedIndexPy<float>::space_name)
+        .def_readonly("dim", &ShardedIndexPy<float>::dim)
+        .def_readwrite("num_threads", &ShardedIndexPy<float>::num_threads_default)
+        .def_property("ef",
+            [](const ShardedIndexPy<float>& idx) { return idx.default_ef; },
+            [](ShardedIndexPy<float>& idx, size_t ef) { idx.set_ef(ef); })
+        .def("__repr__", [](const ShardedIndexPy<float>& a) {
+            return "<hnswlib.ShardedIndex(space='" + a.space_name +
+                   "', dim=" + std::to_string(a.dim) +
+                   ", shards=" + std::to_string(a.n_shards) +
+                   ", elements=" + std::to_string(a.total_elements) + ")>";
+        });
+
         return m.ptr();
 }

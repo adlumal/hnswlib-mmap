@@ -2,10 +2,11 @@
 
 A fork of [hnswlib](https://github.com/nmslib/hnswlib) with memory-mapped storage and graph-only index support for large-scale vector search.
 
-This fork adds two features for working with indexes that exceed available RAM:
+This fork adds three features for working with indexes that exceed available RAM:
 
-1. **Mmap-backed storage**: Use memory-mapped files instead of malloc during index construction
-2. **Graph-only mode**: Store only the graph structure (~95% smaller), with vectors provided externally
+1. **Graph-only mode**: Store only the graph structure (~95% smaller), with vectors provided externally
+2. **FP16 external vectors**: Use half-precision vectors with on-the-fly conversion
+3. **Sharded indexes**: Build indexes larger than RAM by splitting into independently-built shards
 
 These features enable building and searching HNSW indexes with hundreds of millions of vectors on memory-constrained systems.
 
@@ -73,6 +74,59 @@ labels, distances = index.knn_query(query, k=10)
 ```
 
 Vectors are converted to fp32 on-the-fly during distance calculations, using thread-local buffers. This adds minimal overhead while halving memory requirements.
+
+### Sharded indexes
+
+For truly massive datasets (e.g., 314M vectors), even graph-only mode requires more RAM than available during construction. Sharded indexes solve this by building multiple smaller indexes independently:
+
+| Approach | RAM during build (314M vectors, dim=1536) |
+|----------|-------------------------------------------|
+| Full index | ~480 GB |
+| Graph-only | ~24 GB (graph) + ~480 GB (vectors) |
+| **Sharded (32 shards)** | **~15 GB per shard** |
+
+```python
+import hnswlib
+import numpy as np
+
+dim = 1536
+n_total = 314_000_000
+n_shards = 32
+shard_size = (n_total + n_shards - 1) // n_shards  # ~10M per shard
+
+# Build shards one at a time (only ~15GB RAM needed)
+index = hnswlib.ShardedIndex(space='cosine', dim=dim)
+
+for shard_idx in range(n_shards):
+    start = shard_idx * shard_size
+    end = min(start + shard_size, n_total)
+
+    # Load only this shard's vectors into RAM
+    shard_vectors = load_vectors(start, end).astype('float32')
+
+    index.build_shard(shard_vectors, 'index_shards/', shard_idx, start,
+                      M=8, ef_construction=200)
+    del shard_vectors  # Free RAM before next shard
+
+index.save_metadata('index_shards/', n_shards, n_total, M=8, ef_construction=200)
+```
+
+At search time, load all shards with mmap'd vectors:
+
+```python
+# Load vectors as mmap (no RAM for vectors!)
+vectors_fp16 = np.memmap('vectors.mmap', dtype=np.float16, mode='r',
+                          shape=(n_total, dim))
+
+index = hnswlib.ShardedIndex(space='cosine', dim=dim)
+index.load_shards_fp16('index_shards/', vectors_fp16.view(np.uint16), n_shards)
+index.set_ef(50)
+
+# Search returns global indices
+labels, distances = index.knn_query(query, k=10)
+```
+
+The sharded search queries all shards and merges results. Trade-off: slightly higher latency than monolithic index, but enables building on normal hardware.
 
 ### Mmap-backed storage
 
@@ -170,6 +224,26 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
 * `set_external_vectors_fp16(external_vectors)` sets the external vector source in fp16 format. Vectors are converted to fp32 on-the-fly during distance calculations. Pass `array.view(np.uint16)` to this method.
 
 * `load_index_mmap(path_to_index, read_only = True)` loads an existing index using mmap instead of reading into RAM.
+
+**ShardedIndex class** (`hnswlib.ShardedIndex`):
+
+* `ShardedIndex(space, dim)` creates a sharded index for building/searching across multiple shards.
+
+* `build_shard(vectors, output_dir, shard_idx, start_idx, M = 8, ef_construction = 200, num_threads = -1)` builds a single shard. Call once per shard with only that shard's vectors loaded.
+
+* `save_metadata(output_dir, n_shards, total_elements, M, ef_construction)` saves global index metadata after all shards are built.
+
+* `load_shards(output_dir, external_vectors, n_shards)` loads all shards for search with fp32 vectors.
+
+* `load_shards_fp16(output_dir, external_vectors, n_shards)` loads all shards with fp16 vectors (pass `array.view(np.uint16)`).
+
+* `knn_query(data, k = 1, num_threads = -1)` searches across all shards. Returns global indices.
+
+* `set_ef(ef)` sets the ef search parameter for all shards.
+
+* `get_num_shards()` returns the number of loaded shards.
+
+* `get_total_elements()` returns total elements across all shards.
 
 * `set_num_threads(num_threads)` set the default number of cpu threads used during data insertion/querying.
   
