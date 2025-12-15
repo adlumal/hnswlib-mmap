@@ -87,9 +87,9 @@ public:
         auto shard = std::make_unique<HierarchicalNSW<dist_t>>(
             space_, n_elements, vectors, M, ef_construction, 100 + shard_idx, false
         );
-        (void)num_threads;  // Threading handled at Python level via ParallelFor
 
-        // Add all elements
+        // Add all elements in parallel using OpenMP
+        #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
         for (size_t i = 0; i < n_elements; i++) {
             shard->addPoint(vectors + i * dim_, i);
         }
