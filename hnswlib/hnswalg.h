@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "pq_distance.h"
+
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
@@ -139,6 +141,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     const uint16_t* external_vectors_fp16_ptr_{nullptr};  // pointer to fp16 vectors (stored as uint16_t)
     size_t external_vectors_fp16_stride_{0};  // stride between fp16 vectors (in elements, not bytes)
     DISTFUNC<dist_t> original_dist_func_{nullptr};  // original distance function (before fp16 wrapper)
+
+    // Product Quantization mode: use PQ codes + codebooks for compressed vectors
+    bool external_vectors_pq_mode_{false};
+    const uint8_t* external_pq_codes_{nullptr};  // (n_vectors, n_subvectors) uint8
+    size_t pq_code_stride_{0};  // n_subvectors (bytes per vector)
+    PQDistance pq_distance_;  // PQ distance computation helper
+    const int64_t* pq_id_mapping_{nullptr};  // Optional mapping: internal_id -> pq_code_index
+    size_t pq_id_mapping_offset_{0};  // Offset to add before looking up in mapping
 
     DISTFUNC<dist_t> fstdistfunc_;
     void *dist_func_param_{nullptr};
@@ -510,11 +520,52 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    /**
+     * Set external vector source using Product Quantization codes.
+     *
+     * PQ compresses vectors to n_subvectors bytes each. During search,
+     * we precompute a distance lookup table from the query to all centroids,
+     * then each candidate distance is just n_subvectors table lookups + additions.
+     *
+     * @param pq_codes Pointer to PQ codes array (n_vectors, n_subvectors) uint8
+     * @param codebooks Pointer to codebooks (n_subvectors, n_centroids, subvector_dim) float32
+     * @param n_subvectors Number of subvectors (M)
+     * @param n_centroids Number of centroids per subspace (K, typically 256)
+     * @param subvector_dim Dimension of each subspace (dim / n_subvectors)
+     */
+    void setExternalVectorPointerPQ(
+        const uint8_t* pq_codes,
+        const float* codebooks,
+        size_t n_subvectors,
+        size_t n_centroids,
+        size_t subvector_dim,
+        const int64_t* id_mapping = nullptr,  // Optional: maps (offset + internal_id) -> pq_code_index
+        size_t id_mapping_offset = 0          // Offset to add before looking up in mapping
+    ) {
+        external_vectors_mode_ = true;
+        external_vectors_pq_mode_ = true;
+        external_pq_codes_ = pq_codes;
+        pq_code_stride_ = n_subvectors;
+        pq_distance_ = PQDistance(codebooks, n_subvectors, n_centroids, subvector_dim);
+        pq_id_mapping_ = id_mapping;
+        pq_id_mapping_offset_ = id_mapping_offset;
+
+        // Disable other external modes
+        external_vectors_fp16_mode_ = false;
+        external_vectors_fp16_ptr_ = nullptr;
+        external_vectors_ptr_ = nullptr;
+        get_external_vector_ = nullptr;
+    }
+
+
     ~HierarchicalNSW() {
         clear();
     }
 
     void clear() {
+        // Save mmap state before we clear it
+        bool was_mmap = use_mmap_;
+
         if (use_mmap_ && mmap_base_ != nullptr) {
             // For mmap, we need to unmap from the base address, not data_level0_memory_
             // (which may be offset by header size)
@@ -540,9 +591,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             free(data_level0_memory_);
             data_level0_memory_ = nullptr;
         }
-        for (tableint i = 0; i < cur_element_count; i++) {
-            if (element_levels_[i] > 0)
-                free(linkLists_[i]);
+        // Only free linkLists_ entries if not using mmap (mmap entries point into the mapped file)
+        if (!was_mmap) {
+            for (tableint i = 0; i < cur_element_count; i++) {
+                if (element_levels_[i] > 0)
+                    free(linkLists_[i]);
+            }
         }
         free(linkLists_);
         linkLists_ = nullptr;
@@ -614,14 +668,44 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     /**
      * Compute distance from a query point to an internal ID.
-     * Handles fp16 conversion transparently using thread-local buffers.
+     * Handles fp16 and PQ modes transparently using thread-local buffers.
      *
      * @param query_data Pointer to query vector (fp32)
      * @param internal_id Internal ID of target vector
      * @return Distance between query and target
      */
     inline dist_t computeDistanceToId(const void* query_data, tableint internal_id) const {
-        if (external_vectors_fp16_mode_) {
+        if (external_vectors_pq_mode_) {
+            // PQ mode: use precomputed distance table for fast lookup
+            thread_local PQDistanceTableCache pq_cache;
+            thread_local const void* last_query_ptr = nullptr;
+
+            // Check if we need to recompute the distance table for a new query
+            if (query_data != last_query_ptr) {
+                pq_cache.ensureSize(pq_distance_.n_subvectors_, pq_distance_.n_centroids_);
+                pq_distance_.computeDistanceTable(
+                    static_cast<const float*>(query_data),
+                    pq_cache.data()
+                );
+                last_query_ptr = query_data;
+            }
+
+            // Asymmetric distance lookup
+            // With mapping: pq_codes[mapping[offset + label]] for cluster-based sharding
+            // Without mapping: pq_codes[label] for sequential sharding
+            labeltype label = getExternalLabel(internal_id);
+            size_t pq_index;
+            if (pq_id_mapping_) {
+                // Cluster-based sharding: use sort_order to find original PQ index
+                pq_index = static_cast<size_t>(pq_id_mapping_[pq_id_mapping_offset_ + label]);
+            } else {
+                // Sequential sharding: label is the PQ index
+                pq_index = static_cast<size_t>(label);
+            }
+            const uint8_t* code = external_pq_codes_ + pq_index * pq_code_stride_;
+
+            return pq_distance_.asymmetricDistance(pq_cache.data(), code);
+        } else if (external_vectors_fp16_mode_) {
             // FP16 mode: convert to fp32 using thread-local buffer
             thread_local std::vector<float> fp32_buffer;
             if (fp32_buffer.size() < external_vectors_fp16_stride_) {
@@ -772,13 +856,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         dist_t lowerBound;
-        if (bare_bone_search || 
+        if (bare_bone_search ||
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
-            char* ep_data = getDataByInternalId(ep_id);
-            dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+            dist_t dist = computeDistanceToId(data_point, ep_id);
             lowerBound = dist;
             top_candidates.emplace(dist, ep_id);
             if (!bare_bone_search && stop_condition) {
+                // Note: PQ mode doesn't support stop_condition with vector data
+                char* ep_data = external_vectors_pq_mode_ ? nullptr : getDataByInternalId(ep_id);
                 stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
             }
             candidate_set.emplace(-dist, ep_id);
@@ -835,8 +920,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
 
-                    char *currObj1 = (getDataByInternalId(candidate_id));
-                    dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                    dist_t dist = computeDistanceToId(data_point, candidate_id);
 
                     bool flag_consider_candidate;
                     if (!bare_bone_search && stop_condition) {
@@ -853,10 +937,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                         _MM_HINT_T0);  ////////////////////////
 #endif
 
-                        if (bare_bone_search || 
+                        if (bare_bone_search ||
                             (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
                             top_candidates.emplace(dist, candidate_id);
                             if (!bare_bone_search && stop_condition) {
+                                // Note: PQ mode doesn't support stop_condition with vector data
+                                char* currObj1 = external_vectors_pq_mode_ ? nullptr : getDataByInternalId(candidate_id);
                                 stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
                             }
                         }
@@ -1226,7 +1312,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
      * @param location Path to the graph file saved with saveGraph()
      * @param s SpaceInterface for distance computation
      */
-    void loadGraph(const std::string &location, SpaceInterface<dist_t> *s) {
+    void loadGraph(const std::string &location, SpaceInterface<dist_t> *s, bool read_only = false) {
         std::ifstream input(location, std::ios::binary);
         if (!input.is_open())
             throw std::runtime_error("Cannot open graph file");
@@ -1287,12 +1373,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             readBinaryPOD(input, label);
             memcpy(element_data + label_offset_, &label, sizeof(labeltype));
 
-            label_lookup_[label] = i;
+            // Skip label_lookup_ in read-only mode (saves significant RAM for large indexes)
+            if (!read_only) {
+                label_lookup_[label] = i;
+            }
         }
 
         // Allocate and read higher level links
-        std::vector<std::mutex>(max_elements_).swap(link_list_locks_);
-        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
+        // Skip mutex allocation in read-only mode (saves ~200MB per 5M elements)
+        if (!read_only) {
+            std::vector<std::mutex>(max_elements_).swap(link_list_locks_);
+            std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
+        }
         linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
         if (linkLists_ == nullptr)
             throw std::runtime_error("Not enough memory for linklists");
@@ -1317,6 +1409,115 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         visited_list_pool_.reset(new VisitedListPool(1, max_elements_));
 
         input.close();
+    }
+
+
+    /**
+     * Load a graph-only index using memory-mapped I/O.
+     *
+     * This uses significantly less RAM than loadGraph() by memory-mapping
+     * the level 0 data instead of loading it into RAM. The OS will page
+     * data in/out as needed.
+     *
+     * @param location Path to the graph file saved with saveGraph()
+     * @param s SpaceInterface for distance computation
+     */
+    void loadGraphMmap(const std::string &location, SpaceInterface<dist_t> *s) {
+        clear();
+
+        // Open file and get size
+        int fd = open(location.c_str(), O_RDONLY);
+        if (fd == -1)
+            throw std::runtime_error("Cannot open graph file: " + location);
+
+        struct stat st;
+        if (fstat(fd, &st) == -1) {
+            close(fd);
+            throw std::runtime_error("Cannot stat graph file");
+        }
+        size_t file_size = st.st_size;
+
+        // Memory map the entire file
+        void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);  // Can close fd after mmap
+
+        if (mapped == MAP_FAILED)
+            throw std::runtime_error("Failed to mmap graph file");
+
+        // Hint to kernel: random access pattern, don't read-ahead
+        madvise(mapped, file_size, MADV_RANDOM);
+
+        mmap_base_ = (char*)mapped;
+        mmap_size_ = file_size;
+        mmap_path_ = location;
+        use_mmap_ = true;
+
+        // Parse header from mmap
+        char* ptr = mmap_base_;
+
+        uint32_t magic = *reinterpret_cast<uint32_t*>(ptr); ptr += sizeof(uint32_t);
+        if (magic != 0x47524150)
+            throw std::runtime_error("Invalid graph file format (bad magic number)");
+
+        max_elements_ = *reinterpret_cast<size_t*>(ptr); ptr += sizeof(size_t);
+        size_t saved_count = *reinterpret_cast<size_t*>(ptr); ptr += sizeof(size_t);
+        M_ = *reinterpret_cast<size_t*>(ptr); ptr += sizeof(size_t);
+        maxM_ = *reinterpret_cast<size_t*>(ptr); ptr += sizeof(size_t);
+        maxM0_ = *reinterpret_cast<size_t*>(ptr); ptr += sizeof(size_t);
+        ef_construction_ = *reinterpret_cast<size_t*>(ptr); ptr += sizeof(size_t);
+        mult_ = *reinterpret_cast<double*>(ptr); ptr += sizeof(double);
+        maxlevel_ = *reinterpret_cast<int*>(ptr); ptr += sizeof(int);
+        enterpoint_node_ = *reinterpret_cast<tableint*>(ptr); ptr += sizeof(tableint);
+        size_t saved_data_size = *reinterpret_cast<size_t*>(ptr); ptr += sizeof(size_t);
+
+        // Initialize from SpaceInterface
+        data_size_ = s->get_data_size();
+        if (data_size_ != saved_data_size) {
+            throw std::runtime_error("Vector dimension mismatch");
+        }
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+
+        // Set up graph-only mode
+        external_vectors_mode_ = true;
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_data_per_element_ = size_links_level0_ + sizeof(labeltype);
+        label_offset_ = size_links_level0_;
+        offsetData_ = size_links_level0_;
+        offsetLevel0_ = 0;
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+
+        // Point data_level0_memory_ directly into the mmap (no copy!)
+        data_level0_memory_ = ptr;
+
+        // Skip past level 0 data to reach higher-level links
+        ptr += saved_count * size_data_per_element_;
+
+        // Allocate small structures for higher-level links
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory for linklists");
+        element_levels_ = std::vector<int>(max_elements_);
+
+        // Parse higher-level links (still in mmap, just set pointers)
+        for (size_t i = 0; i < saved_count; i++) {
+            unsigned int linkListSize = *reinterpret_cast<unsigned int*>(ptr);
+            ptr += sizeof(unsigned int);
+
+            if (linkListSize == 0) {
+                element_levels_[i] = 0;
+                linkLists_[i] = nullptr;
+            } else {
+                element_levels_[i] = linkListSize / size_links_per_element_;
+                linkLists_[i] = ptr;  // Point directly into mmap!
+                ptr += linkListSize;
+            }
+        }
+
+        cur_element_count = saved_count;
+        visited_list_pool_.reset(new VisitedListPool(1, max_elements_));
     }
 
 
@@ -2033,7 +2234,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (cur_element_count == 0) return result;
 
         tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        dist_t curdist = computeDistanceToId(query_data, enterpoint_node_);
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -2051,7 +2252,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    dist_t d = computeDistanceToId(query_data, cand);
 
                     if (d < curdist) {
                         curdist = d;
@@ -2093,7 +2294,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (cur_element_count == 0) return result;
 
         tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        dist_t curdist = computeDistanceToId(query_data, enterpoint_node_);
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -2111,7 +2312,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    dist_t d = computeDistanceToId(query_data, cand);
 
                     if (d < curdist) {
                         curdist = d;

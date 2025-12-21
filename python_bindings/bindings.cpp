@@ -1135,6 +1135,10 @@ public:
         num_threads_default = num_threads;
     }
 
+    void set_labels_are_global(bool value) {
+        sharded_index->setLabelsAreGlobal(value);
+    }
+
     void normalize_vector(float* data, float* norm_array) {
         float norm = 0.0f;
         for (int i = 0; i < dim; i++)
@@ -1237,7 +1241,8 @@ public:
     void loadShardsFp16(
         const std::string& output_dir,
         py::array_t<uint16_t, py::array::c_style> external_vectors,
-        size_t n_shards
+        size_t n_shards,
+        bool use_mmap_graphs = false
     ) {
         auto buffer = external_vectors.request();
         if (buffer.ndim != 2) {
@@ -1251,7 +1256,83 @@ public:
         total_elements = buffer.shape[0];
 
         py::gil_scoped_release release;
-        sharded_index->loadShardsFp16(output_dir, vectors_ptr, n_shards);
+        sharded_index->loadShardsFp16(output_dir, vectors_ptr, n_shards, use_mmap_graphs);
+        sharded_index->setEf(default_ef);
+        this->n_shards = n_shards;
+    }
+
+    /**
+     * Load all shards for search with PQ (Product Quantization) codes.
+     *
+     * PQ compresses vectors to n_subvectors bytes each, enabling search on
+     * datasets too large to fit in memory. Distance computation uses asymmetric
+     * lookup tables computed from the query.
+     */
+    void loadShardsPQ(
+        const std::string& output_dir,
+        py::array_t<uint8_t, py::array::c_style> pq_codes,
+        py::array_t<float, py::array::c_style | py::array::forcecast> codebooks,
+        size_t n_shards,
+        size_t n_subvectors,
+        size_t n_centroids,
+        size_t subvector_dim,
+        bool use_mmap_graphs = false,
+        size_t n_ram_shards = 0,
+        py::object sort_order_obj = py::none()
+    ) {
+        // Validate PQ codes array
+        auto codes_buffer = pq_codes.request();
+        if (codes_buffer.ndim != 2) {
+            throw std::runtime_error("PQ codes must be a 2D array (n_vectors, n_subvectors)");
+        }
+        if ((size_t)codes_buffer.shape[1] != n_subvectors) {
+            throw std::runtime_error("PQ codes dimension mismatch (got " +
+                                     std::to_string(codes_buffer.shape[1]) + ", expected " +
+                                     std::to_string(n_subvectors) + ")");
+        }
+
+        // Validate codebooks array
+        auto cb_buffer = codebooks.request();
+        if (cb_buffer.ndim != 3) {
+            throw std::runtime_error("Codebooks must be a 3D array (n_subvectors, n_centroids, subvector_dim)");
+        }
+        if ((size_t)cb_buffer.shape[0] != n_subvectors ||
+            (size_t)cb_buffer.shape[1] != n_centroids ||
+            (size_t)cb_buffer.shape[2] != subvector_dim) {
+            throw std::runtime_error("Codebooks shape mismatch");
+        }
+
+        // Verify dimension consistency
+        if (n_subvectors * subvector_dim != (size_t)dim) {
+            throw std::runtime_error("PQ dimension mismatch: n_subvectors * subvector_dim (" +
+                                     std::to_string(n_subvectors * subvector_dim) +
+                                     ") != dim (" + std::to_string(dim) + ")");
+        }
+
+        // Handle optional sort_order for cluster-based sharding
+        const int64_t* sort_order_ptr = nullptr;
+        if (!sort_order_obj.is_none()) {
+            py::array_t<int64_t, py::array::c_style> sort_order = sort_order_obj.cast<py::array_t<int64_t, py::array::c_style>>();
+            auto so_buffer = sort_order.request();
+            if (so_buffer.ndim != 1) {
+                throw std::runtime_error("sort_order must be a 1D array");
+            }
+            if ((size_t)so_buffer.shape[0] != (size_t)codes_buffer.shape[0]) {
+                throw std::runtime_error("sort_order length must match number of vectors");
+            }
+            sort_order_ptr = static_cast<const int64_t*>(so_buffer.ptr);
+        }
+
+        const uint8_t* codes_ptr = static_cast<const uint8_t*>(codes_buffer.ptr);
+        const float* codebooks_ptr = static_cast<const float*>(cb_buffer.ptr);
+        total_elements = codes_buffer.shape[0];
+
+        py::gil_scoped_release release;
+        sharded_index->loadShardsPQ(
+            output_dir, codes_ptr, codebooks_ptr, n_shards,
+            n_subvectors, n_centroids, subvector_dim, use_mmap_graphs, n_ram_shards,
+            sort_order_ptr
+        );
         sharded_index->setEf(default_ef);
         this->n_shards = n_shards;
     }
@@ -1305,6 +1386,100 @@ public:
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                     auto result = sharded_index->searchKnn(
                         (void*)items.data(row), k);
+
+                    size_t i = k - 1;
+                    while (!result.empty() && i < k) {
+                        auto& top = result.top();
+                        data_numpy_d[row * k + i] = top.first;
+                        data_numpy_l[row * k + i] = top.second;
+                        result.pop();
+                        i--;
+                    }
+                });
+            }
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                { rows, k },
+                { k * sizeof(hnswlib::labeltype), sizeof(hnswlib::labeltype) },
+                data_numpy_l,
+                free_when_done_l),
+            py::array_t<dist_t>(
+                { rows, k },
+                { k * sizeof(dist_t), sizeof(dist_t) },
+                data_numpy_d,
+                free_when_done_d));
+    }
+
+    /**
+     * Search only specific shards (for IVF-style routing).
+     */
+    py::object knnQuerySelective(
+        py::object input,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> shard_ids,
+        size_t k = 1,
+        int num_threads = -1
+    ) {
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (features != (size_t)dim) {
+            throw std::runtime_error("Query dimension mismatch");
+        }
+
+        // Extract shard ids
+        auto shard_buffer = shard_ids.request();
+        std::vector<size_t> shard_vec;
+        if (shard_buffer.ndim == 1) {
+            for (size_t i = 0; i < (size_t)shard_buffer.shape[0]; i++) {
+                shard_vec.push_back(static_cast<size_t>(shard_ids.at(i)));
+            }
+        } else {
+            throw std::runtime_error("shard_ids must be a 1D array");
+        }
+
+        hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
+        dist_t* data_numpy_d = new dist_t[rows * k];
+
+        // Initialize with zeros in case we get fewer results
+        std::memset(data_numpy_l, 0, rows * k * sizeof(hnswlib::labeltype));
+        std::memset(data_numpy_d, 0, rows * k * sizeof(dist_t));
+
+        {
+            py::gil_scoped_release release;
+
+            if (normalize) {
+                std::vector<float> norm_array(num_threads * dim);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * dim;
+                    normalize_vector(const_cast<float*>(static_cast<const float*>(items.data(row))),
+                                    norm_array.data() + start_idx);
+
+                    auto result = sharded_index->searchKnnSelective(
+                        (void*)(norm_array.data() + start_idx), shard_vec, k);
+
+                    size_t i = k - 1;
+                    while (!result.empty() && i < k) {
+                        auto& top = result.top();
+                        data_numpy_d[row * k + i] = top.first;
+                        data_numpy_l[row * k + i] = top.second;
+                        result.pop();
+                        i--;
+                    }
+                });
+            } else {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    auto result = sharded_index->searchKnnSelective(
+                        (void*)items.data(row), shard_vec, k);
 
                     size_t i = k - 1;
                     while (!result.empty() && i < k) {
@@ -1442,7 +1617,7 @@ PYBIND11_PLUGIN(hnswlib) {
                 index = hnswlib.Index(space='cosine', dim=384)
                 index.init_index_graph_only(1000000, vectors, M=8)
                 index.add_items(vectors)  # vectors already set, just builds graph
-                index.save_graph('wiki.graph')  # ~21GB instead of ~500GB!
+                index.save_graph('index.graph')  # Much smaller than save_index!
             )pbdoc")
         .def("set_external_vectors",
             &Index<float>::set_external_vectors,
@@ -1476,7 +1651,7 @@ PYBIND11_PLUGIN(hnswlib) {
                                          shape=(n_elements, dim))
 
                 index = hnswlib.Index(space='cosine', dim=dim)
-                index.load_graph('wiki.graph')
+                index.load_graph('index.graph')
                 index.set_external_vectors_fp16(vectors_fp16.view(np.uint16))
                 labels, distances = index.knn_query(query, k=10)  # query must be fp32
             )pbdoc")
@@ -1486,9 +1661,8 @@ PYBIND11_PLUGIN(hnswlib) {
             R"pbdoc(
             Save only the graph structure (no vectors).
 
-            The resulting file is MUCH smaller than save_index():
-            - save_index: ~500GB for 314M vectors, dim=384, M=8
-            - save_graph: ~21GB for the same index
+            The resulting file is MUCH smaller than save_index() since it excludes
+            the vectors. Graph-only files are typically ~95% smaller.
 
             Load with load_graph() and call set_external_vectors() to provide vectors.
 
@@ -1509,7 +1683,7 @@ PYBIND11_PLUGIN(hnswlib) {
 
             Example:
                 index = hnswlib.Index(space='cosine', dim=384)
-                index.load_graph('wiki.graph')
+                index.load_graph('index.graph')
                 index.set_external_vectors(my_vectors)  # mmap'd numpy array
                 labels, distances = index.knn_query(query, k=10)
             )pbdoc")
@@ -1586,9 +1760,8 @@ PYBIND11_PLUGIN(hnswlib) {
             Sharding enables building indexes larger than available RAM by splitting
             the data into multiple smaller indexes (shards) that are built independently.
 
-            For 314M vectors with 1536 dimensions:
-            - Full index would need ~480GB RAM during build
-            - With 32 shards of ~10M vectors each: ~15GB RAM per shard
+            For very large datasets, a monolithic index would exceed RAM during build.
+            With shards of ~10M vectors each, you only need ~15GB RAM per shard.
 
             Args:
                 space: Distance metric ('l2', 'ip', or 'cosine')
@@ -1682,6 +1855,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("output_dir"),
             py::arg("external_vectors"),
             py::arg("n_shards"),
+            py::arg("use_mmap_graphs") = false,
             R"pbdoc(
             Load all shards for search with fp16 vectors.
 
@@ -1693,6 +1867,67 @@ PYBIND11_PLUGIN(hnswlib) {
                 external_vectors: Numpy array as uint16 view of float16 data.
                                   Pass your_fp16_array.view(np.uint16)
                 n_shards: Number of shards to load
+                use_mmap_graphs: If True, memory-map graph files instead of loading
+                                 into RAM. Uses ~4GB instead of ~28GB for 64 shards,
+                                 but may be slower due to disk I/O during search.
+            )pbdoc")
+        .def("load_shards_pq",
+            &ShardedIndexPy<float>::loadShardsPQ,
+            py::arg("output_dir"),
+            py::arg("pq_codes"),
+            py::arg("codebooks"),
+            py::arg("n_shards"),
+            py::arg("n_subvectors"),
+            py::arg("n_centroids"),
+            py::arg("subvector_dim"),
+            py::arg("use_mmap_graphs") = false,
+            py::arg("n_ram_shards") = 0,
+            py::arg("sort_order") = py::none(),
+            R"pbdoc(
+            Load all shards for search with Product Quantization codes.
+
+            PQ compresses vectors to n_subvectors bytes each, enabling search on
+            datasets much larger than RAM. For hundreds of millions of vectors,
+            PQ provides ~8x compression with ~94% recall@10.
+
+            During search, a distance lookup table is computed from the query,
+            then each candidate distance is just n_subvectors table lookups.
+
+            Args:
+                output_dir: Directory containing shard graphs
+                pq_codes: Numpy array of shape (n_vectors, n_subvectors), dtype=uint8
+                          Memory-map this for minimal RAM usage!
+                codebooks: Numpy array of shape (n_subvectors, n_centroids, subvector_dim),
+                           dtype=float32. Typically ~1-2MB for 192 subvectors.
+                n_shards: Number of shards to load
+                n_subvectors: Number of PQ subvectors (M)
+                n_centroids: Centroids per subspace (K, typically 256)
+                subvector_dim: Dimension of each subspace (dim / n_subvectors)
+                use_mmap_graphs: If True, memory-map graph files instead of loading into RAM
+                n_ram_shards: Hybrid mode - load first N shards into RAM, mmap the rest (0=disabled)
+                sort_order: Optional mapping for cluster-based sharding. Numpy array of shape
+                           (n_vectors,) dtype=int64 where sort_order[reordered_idx] = original_idx.
+                           Required when shards group vectors by cluster rather than sequential order.
+
+            Example:
+                import numpy as np
+                import hnswlib
+
+                # Load PQ data (mmap for minimal RAM)
+                pq_codes = np.memmap('pq_codes.mmap', dtype=np.uint8, mode='r',
+                                      shape=(313628622, 192))
+                codebooks_data = np.load('pq_codebooks.npz')
+                codebooks = codebooks_data['codebooks']  # (192, 256, 2)
+
+                # Create index and load with PQ
+                index = hnswlib.ShardedIndex('cosine', dim=384)
+                index.load_shards_pq('index_dir/', pq_codes, codebooks, n_shards=64,
+                                     n_subvectors=192, n_centroids=256, subvector_dim=2)
+                index.set_ef(100)
+
+                # Search (query must be normalized fp32)
+                query = normalize(query_vector)  # shape (1, 384)
+                labels, distances = index.knn_query(query, k=10)
             )pbdoc")
         .def("knn_query",
             &ShardedIndexPy<float>::knnQuery,
@@ -1712,9 +1947,51 @@ PYBIND11_PLUGIN(hnswlib) {
             Returns:
                 Tuple of (labels, distances), each shape (n_queries, k)
             )pbdoc")
+        .def("knn_query_selective",
+            &ShardedIndexPy<float>::knnQuerySelective,
+            py::arg("data"),
+            py::arg("shard_ids"),
+            py::arg("k") = 1,
+            py::arg("num_threads") = -1,
+            R"pbdoc(
+            Search only specific shards and return top-k results.
+
+            This enables IVF-style search where only relevant clusters are searched,
+            dramatically reducing I/O and compute. Use with cluster centroids to
+            determine which shards to search.
+
+            Args:
+                data: Query vector(s), shape (n_queries, dim) or (dim,)
+                shard_ids: Array of shard indices to search, shape (n_shards_to_search,)
+                k: Number of results per query
+                num_threads: Number of threads (default: all CPUs)
+
+            Returns:
+                Tuple of (labels, distances), each shape (n_queries, k)
+
+            Example:
+                # Load centroids and find nearest clusters
+                centroids = np.load('centroids.npy')
+                similarities = query @ centroids.T
+                top_clusters = np.argsort(-similarities)[:n_probe]
+
+                # Search only those clusters
+                labels, distances = index.knn_query_selective(query, top_clusters, k=10)
+            )pbdoc")
         .def("set_ef", &ShardedIndexPy<float>::set_ef, py::arg("ef"),
             R"pbdoc(Set ef search parameter for all shards.)pbdoc")
         .def("set_num_threads", &ShardedIndexPy<float>::set_num_threads, py::arg("num_threads"))
+        .def("set_labels_are_global", &ShardedIndexPy<float>::set_labels_are_global, py::arg("value"),
+            R"pbdoc(
+            Set whether stored labels in graphs are already global indices.
+
+            When True, search methods return labels as-is without adding the shard's
+            start_idx offset. Use this when graphs were built with global labels
+            (e.g., IVF-HNSW where labels are reordered indices).
+
+            Args:
+                value: True if labels are already global, False for local 0-based labels
+            )pbdoc")
         .def("get_total_elements", &ShardedIndexPy<float>::getTotalElements)
         .def("get_num_shards", &ShardedIndexPy<float>::getNumShards)
         .def_readonly("space", &ShardedIndexPy<float>::space_name)

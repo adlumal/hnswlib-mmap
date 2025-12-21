@@ -2,11 +2,13 @@
 
 A fork of [hnswlib](https://github.com/nmslib/hnswlib) with memory-mapped storage and graph-only index support for large-scale vector search.
 
-This fork adds three features for working with indexes that exceed available RAM:
+This fork adds five features for working with indexes that exceed available RAM:
 
 1. **Graph-only mode**: Store only the graph structure (~95% smaller), with vectors provided externally
 2. **FP16 external vectors**: Use half-precision vectors with on-the-fly conversion
 3. **Sharded indexes**: Build indexes larger than RAM by splitting into independently-built shards
+4. **Product Quantization (PQ)**: Compress vectors to ~8x smaller with ~94% recall for extreme scale
+5. **IVF-HNSW**: Cluster-based shard routing to search only relevant shards, reducing I/O by 8-16x
 
 These features enable building and searching HNSW indexes with hundreds of millions of vectors on memory-constrained systems.
 
@@ -22,10 +24,10 @@ These features enable building and searching HNSW indexes with hundreds of milli
 
 Standard hnswlib stores vectors alongside the graph structure. For large indexes, this dominates memory usage:
 
-| Mode | Storage per element (M=8, dim=384) | 314M vectors |
+| Mode | Storage per element (M=8, dim=384) | 100M vectors |
 |------|-----------------------------------|--------------|
-| Standard | ~1,612 bytes | ~509 GB |
-| Graph-only | ~76 bytes | ~24 GB |
+| Standard | ~1,612 bytes | ~161 GB |
+| Graph-only | ~76 bytes | ~8 GB |
 
 Graph-only mode stores only the HNSW graph. Vectors are provided via a pointer to an external array (e.g., a memory-mapped numpy file).
 
@@ -59,7 +61,7 @@ labels, distances = index2.knn_query(query, k=10)
 When your vectors are stored as float16 (e.g., to save disk space), you can use them directly without converting the entire array to float32:
 
 ```python
-# Load fp16 vectors from disk (only 240GB instead of 480GB for 314M x 384)
+# Load fp16 vectors from disk (half the size of fp32)
 vectors_fp16 = np.memmap('vectors.mmap', dtype=np.float16, mode='r',
                          shape=(n, dim))
 
@@ -77,20 +79,20 @@ Vectors are converted to fp32 on-the-fly during distance calculations, using thr
 
 ### Sharded indexes
 
-For truly massive datasets (e.g., 314M vectors), even graph-only mode requires more RAM than available during construction. Sharded indexes solve this by building multiple smaller indexes independently:
+For truly massive datasets (hundreds of millions of vectors), even graph-only mode requires more RAM than available during construction. Sharded indexes solve this by building multiple smaller indexes independently:
 
-| Approach | RAM during build (314M vectors, dim=1536) |
-|----------|-------------------------------------------|
-| Full index | ~480 GB |
-| Graph-only | ~24 GB (graph) + ~480 GB (vectors) |
-| **Sharded (32 shards)** | **~15 GB per shard** |
+| Approach | RAM during build |
+|----------|------------------|
+| Full index | Proportional to dataset size |
+| Graph-only | Graph + vectors must fit |
+| **Sharded** | **~15 GB per shard** |
 
 ```python
 import hnswlib
 import numpy as np
 
 dim = 1536
-n_total = 314_000_000
+n_total = 100_000_000
 n_shards = 32
 shard_size = (n_total + n_shards - 1) // n_shards  # ~10M per shard
 
@@ -128,6 +130,22 @@ labels, distances = index.knn_query(query, k=10)
 
 The sharded search queries all shards and merges results. Trade-off: slightly higher latency than monolithic index, but enables building on normal hardware.
 
+### Memory-mapped graph loading
+
+For extremely memory-constrained environments, you can also memory-map the graph files themselves instead of loading them into RAM:
+
+```python
+# Load with mmap'd graphs - uses ~4GB instead of ~28GB for 64 shards
+index = hnswlib.ShardedIndex(space='cosine', dim=dim)
+index.load_shards_fp16('index_shards/', vectors_fp16.view(np.uint16), n_shards,
+                       use_mmap_graphs=True)
+```
+
+Trade-off: Mmap'd graphs have higher search latency due to disk I/O during graph traversal, and actual memory usage depends on page cache behavior. Best used when:
+- You have limited RAM but fast SSD storage
+- You need to load more shards than RAM allows
+- You're doing infrequent queries where latency is less critical
+
 ### Mmap-backed storage
 
 For building indexes from scratch when even graph construction exceeds RAM, use mmap-backed storage:
@@ -140,6 +158,161 @@ index.save_index('index.bin')  # or save_graph for graph-only
 ```
 
 This creates a file-backed memory map instead of allocating heap memory.
+
+### Product Quantization (PQ)
+
+For the largest datasets where even FP16 vectors don't fit, Product Quantization compresses vectors to just M bytes each (where M is the number of subvectors). This enables searching datasets that would otherwise require terabytes of storage:
+
+| Format | Storage (100M vectors, dim=384) | Recall@10 |
+|--------|--------------------------------|-----------|
+| FP32 | 153 GB | 100% |
+| FP16 | 77 GB | ~100% |
+| **PQ (M=192)** | **18 GB** | **~94%** |
+
+PQ works by splitting each vector into M subvectors and quantizing each subspace independently using 256 centroids. At search time, distances are computed using precomputed lookup tables - just M table lookups instead of dim multiplications.
+
+```python
+import numpy as np
+import hnswlib
+
+dim = 384
+n_total = 100_000_000
+n_shards = 64
+n_subvectors = 192  # 2 dimensions per subvector
+n_centroids = 256
+
+# Build shards first (same as before)
+index = hnswlib.ShardedIndex(space='cosine', dim=dim)
+# ... build shards ...
+
+# Train PQ codebooks on a sample of your data (use k-means or similar)
+# codebooks shape: (n_subvectors, n_centroids, subvector_dim)
+codebooks = train_pq_codebooks(sample_vectors, n_subvectors, n_centroids)
+
+# Encode all vectors to PQ codes
+# pq_codes shape: (n_total, n_subvectors), dtype=uint8
+pq_codes = encode_vectors_pq(all_vectors, codebooks)
+
+# Save PQ data
+np.savez('pq_codebooks.npz', codebooks=codebooks)
+pq_mmap = np.memmap('pq_codes.mmap', dtype=np.uint8, mode='w+',
+                    shape=(n_total, n_subvectors))
+pq_mmap[:] = pq_codes
+pq_mmap.flush()
+```
+
+At search time, load with PQ codes instead of vectors:
+
+```python
+# Load PQ data (mmap for minimal RAM)
+pq_codes = np.memmap('pq_codes.mmap', dtype=np.uint8, mode='r',
+                     shape=(n_total, n_subvectors))
+codebooks = np.load('pq_codebooks.npz')['codebooks']
+
+# Load shards with PQ
+index = hnswlib.ShardedIndex(space='cosine', dim=dim)
+index.load_shards_pq(
+    'index_shards/',
+    pq_codes,
+    codebooks,
+    n_shards=64,
+    n_subvectors=192,
+    n_centroids=256,
+    subvector_dim=2  # dim / n_subvectors
+)
+index.set_ef(100)
+
+# Search - query must be normalized fp32
+query = normalize(query_vector.astype(np.float32))
+labels, distances = index.knn_query(query, k=10)
+```
+
+**Hybrid loading** - when you have enough RAM for some shards but not all:
+
+```python
+# Load first 32 shards into RAM, mmap the remaining 32
+index.load_shards_pq(
+    'index_shards/',
+    pq_codes,
+    codebooks,
+    n_shards=64,
+    n_subvectors=192,
+    n_centroids=256,
+    subvector_dim=2,
+    n_ram_shards=32  # First 32 in RAM, rest mmap'd
+)
+```
+
+PQ is ideal when:
+- Your dataset is too large for FP16 (hundreds of millions of vectors)
+- You can accept ~94% recall instead of ~100%
+- You have compute to train codebooks offline
+
+### IVF-HNSW (cluster-based shard routing)
+
+IVF-HNSW combines IVF (Inverted File Index) routing with HNSW search. Instead of searching all shards, queries are routed to only the most relevant clusters based on centroid similarity.
+
+**IVF vs IVF-HNSW:**
+
+| Approach | Cluster routing | Intra-cluster search | Use case |
+|----------|----------------|---------------------|----------|
+| Pure IVF | k-means centroids | Exhaustive scan | Small clusters |
+| **IVF-HNSW** | k-means centroids | HNSW graph search | Large clusters |
+
+Pure IVF does brute-force search within selected clusters. With large datasets split across 64 clusters, each cluster can have millions of vectors - exhaustive scan would be too slow. IVF-HNSW uses HNSW for O(log n) intra-cluster search instead.
+
+**I/O reduction:**
+
+| Search mode | Shards searched | Relative I/O |
+|-------------|-----------------|--------------|
+| Full search | 64 | 100% |
+| IVF-HNSW (n_probe=8) | 8 | 12.5% |
+| IVF-HNSW (n_probe=4) | 4 | 6.25% |
+
+```python
+import numpy as np
+import hnswlib
+
+# Load index (same as before)
+index = hnswlib.ShardedIndex('cosine', dim=384)
+index.load_shards_pq('index_dir/', pq_codes, codebooks, n_shards=64, ...)
+index.set_ef(50)
+
+# Load cluster centroids (one per shard, trained with k-means)
+centroids = np.load('centroids.npy')  # shape: (64, 384)
+
+# For each query, find nearest clusters via centroid comparison
+def find_nearest_clusters(query, centroids, n_probe):
+    query_norm = query / np.linalg.norm(query)
+    similarities = query_norm @ centroids.T
+    return np.argsort(-similarities)[:n_probe]
+
+# Search only the relevant shards
+query = get_query_vector()  # shape: (384,)
+nearest_clusters = find_nearest_clusters(query, centroids, n_probe=4)
+
+# IVF-HNSW search - only touches 4 shards instead of 64
+labels, distances = index.knn_query_selective(
+    query.reshape(1, -1),
+    np.array(nearest_clusters, dtype=np.int64),
+    k=10
+)
+```
+
+**When to use IVF-HNSW:**
+- Large clusters where exhaustive search would be slow (>100K vectors per cluster)
+- Shards organized by semantic similarity (cluster-based, not sequential)
+- Cold-start latency is a concern (fewer shards = less data to page in)
+- You can accept slightly lower recall for much faster search
+
+**Building cluster-based shards:**
+
+1. Train k-means on a sample of vectors to get cluster centroids
+2. Assign all vectors to their nearest centroid
+3. Reorder vectors by cluster assignment
+4. Build one HNSW shard per cluster
+
+The key insight is that semantically similar vectors end up in the same shard, so searching only nearby clusters maintains high recall while dramatically reducing I/O.
 
 ---
 
@@ -235,9 +408,23 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
 
 * `load_shards(output_dir, external_vectors, n_shards)` loads all shards for search with fp32 vectors.
 
-* `load_shards_fp16(output_dir, external_vectors, n_shards)` loads all shards with fp16 vectors (pass `array.view(np.uint16)`).
+* `load_shards_fp16(output_dir, external_vectors, n_shards, use_mmap_graphs=False)` loads all shards with fp16 vectors (pass `array.view(np.uint16)`). Set `use_mmap_graphs=True` to memory-map graph files instead of loading into RAM.
+
+* `load_shards_pq(output_dir, pq_codes, codebooks, n_shards, n_subvectors, n_centroids, subvector_dim, use_mmap_graphs=False, n_ram_shards=0)` loads all shards with Product Quantization codes for compressed vector search.
+    * `pq_codes`: numpy array of shape `(n_vectors, n_subvectors)`, dtype=uint8. Can be memory-mapped.
+    * `codebooks`: numpy array of shape `(n_subvectors, n_centroids, subvector_dim)`, dtype=float32.
+    * `n_subvectors`: number of subvectors (M). Must satisfy `dim = n_subvectors * subvector_dim`.
+    * `n_centroids`: centroids per subspace (typically 256).
+    * `subvector_dim`: dimension of each subspace (`dim / n_subvectors`).
+    * `use_mmap_graphs`: if True, memory-map graph files instead of loading into RAM.
+    * `n_ram_shards`: hybrid mode - load first N shards into RAM, mmap the rest (0=disabled). Useful when you have enough RAM for some shards but not all.
 
 * `knn_query(data, k = 1, num_threads = -1)` searches across all shards. Returns global indices.
+
+* `knn_query_selective(data, shard_ids, k = 1, num_threads = -1)` searches only the specified shards. Use for IVF-HNSW where you first find nearest cluster centroids, then search only those clusters.
+    * `shard_ids`: numpy array of shard indices to search, dtype=int64.
+    * Returns global indices (same as `knn_query`).
+    * See the IVF-HNSW section above for usage example.
 
 * `set_ef(ef)` sets the ef search parameter for all shards.
 
